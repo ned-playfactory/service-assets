@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log*
+yarn-error.log*
+dist
+coverage
+.env
+.DS_Store
+src/public/skins/*
+!src/public/skins/.keep
+node_modules/
+.DS_Store
+*.log
+.env
+
