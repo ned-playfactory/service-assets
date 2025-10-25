@@ -7,8 +7,8 @@ coverage
 .DS_Store
 src/public/skins/*
 !src/public/skins/.keep
+assets/packs/
 node_modules/
 .DS_Store
 *.log
 .env
-
