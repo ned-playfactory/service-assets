@@ -1,14 +1,20 @@
-node_modules
+# dependencies & logs
+node_modules/
 npm-debug.log*
 yarn-error.log*
+*.log
+
+# build artifacts / coverage
 dist
 coverage
+
+# env & os noise
 .env
 .DS_Store
+
+# generated static exports
 src/public/skins/*
 !src/public/skins/.keep
+
+# runtime-generated packs (persist via volume, never commit)
 assets/packs/
-node_modules/
-.DS_Store
-*.log
-.env
