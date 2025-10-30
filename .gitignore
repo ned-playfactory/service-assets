@@ -18,3 +18,7 @@ src/public/skins/*
 
 # runtime-generated packs (persist via volume, never commit)
 assets/packs/
+
+# mirrored packs for local inspection
+generated-packs/
+!generated-packs/.gitkeep
