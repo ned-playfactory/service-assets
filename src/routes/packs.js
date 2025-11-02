@@ -155,6 +155,21 @@ router.post('/', async (req, res) => {
   const packsDir = req.app.get('packsDir');
   const mirrorDir = req.app.get('packsMirrorDir');
   const mergedPrompt = [gameName, stylePrompt].map((s) => (s || '').trim()).filter(Boolean).join(' — ');
+  const pendingKey = gameId ? String(gameId) : null;
+
+  if (pendingKey && pendingJobs.has(pendingKey)) {
+    log('rejecting concurrent pack request', { gameId: pendingKey });
+    emitProgress(progressChannel, 'rejected', {
+      gameId: pendingKey,
+      reason: 'job_in_progress',
+    });
+    closeChannel(progressChannel);
+    res.status(409).json({
+      ok: false,
+      error: 'An asset generation job is already running for this game. Please wait for it to finish or cancel it first.',
+    });
+    return;
+  }
 
   const packId = `pack_${Date.now()}_${nanoid(6)}`;
   const baseDir = path.join(packsDir, packId);
