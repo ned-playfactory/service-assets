@@ -908,10 +908,18 @@ router.post('/', async (req, res) => {
             if (cancelled) break;
             const fallbackSvg = (() => {
               if (normalizedRole === 'cover') {
+                const coverSeed = `${gameId || ''}-${packId}-${Date.now()}`;
+                log('cover render fallback', {
+                  packId,
+                  gameId,
+                  seed: coverSeed,
+                  prompt: promptForModel,
+                });
                 return renderCoverSVG({
                   size: pieceSize,
                   theme,
                   title: gameName || stylePrompt || 'Custom Game',
+                  seed: coverSeed,
                 });
               }
               try {
