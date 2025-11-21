@@ -10,7 +10,30 @@ const OPENAI_TEMP = Number(process.env.AI_SVG_TEMP || 0.05);
 const OPENAI_SEED_RAW = process.env.AI_SVG_SEED;
 let seedWarningLogged = false;
 
-const openAiEnabled = PROVIDER === 'openai' && !!OPENAI_API_KEY;
+const openAiAvailable = !!OPENAI_API_KEY;
+let availabilityLogged = false;
+
+function shouldUseOpenAI(preference = 'auto') {
+  const pref = String(preference || 'auto').toLowerCase();
+  if (pref === 'local') return false;
+  if (pref === 'openai') return openAiAvailable;
+  // auto → follow env
+  return PROVIDER === 'openai' && openAiAvailable;
+}
+
+export function isOpenAiSvgAvailable(preference = 'auto') {
+  return shouldUseOpenAI(preference);
+}
+
+export function getOpenAiSvgEnv() {
+  return {
+    envProvider: PROVIDER || 'unset',
+    openAiAvailable,
+    hasKey: Boolean(OPENAI_API_KEY),
+    keyLen: OPENAI_API_KEY ? OPENAI_API_KEY.length : 0,
+    model: OPENAI_MODEL,
+  };
+}
 
 function extractSvgFromResponse(data) {
   if (!data) return null;
@@ -37,7 +60,7 @@ function extractSvgFromResponse(data) {
 }
 
 async function callOpenAI({ prompt, signal }) {
-  if (!openAiEnabled) return null;
+  if (!openAiAvailable) return null;
   const body = {
     model: OPENAI_MODEL,
     input: prompt,
@@ -103,8 +126,29 @@ export async function generateAISVG({
   size,
   theme,
   signal,
+  providerPreference = 'auto',
 }) {
-  if (!openAiEnabled || !role) return null;
+  if (!role) return null;
+  const useOpenAI = shouldUseOpenAI(providerPreference);
+  if (!availabilityLogged) {
+    availabilityLogged = true;
+    console.log('[aiSvg] availability', {
+      providerPreference,
+      envProvider: PROVIDER || 'unset',
+      openAiAvailable,
+      model: OPENAI_MODEL,
+      hasKey: Boolean(OPENAI_API_KEY && OPENAI_API_KEY.length),
+    });
+  }
+  if (!useOpenAI) {
+    console.warn('[aiSvg] skipping openai', {
+      providerPreference,
+      envProvider: PROVIDER || 'unset',
+      openAiAvailable,
+      hasKey: Boolean(OPENAI_API_KEY),
+    });
+    return null;
+  }
 
   const sanitizedPrompt = (prompt || '').trim() || 'custom board game';
   const normalizedRole = String(role || 'token').toLowerCase();
@@ -114,7 +158,7 @@ export async function generateAISVG({
     const paletteLine = theme
       ? `Primary palette: ${theme.p1Color || '#1e90ff'} & ${theme.p2Color || '#ff3b30'} with accents of ${theme.accent || '#ffd60a'}.`
       : '';
-    const instructions = `You are an SVG generator. Produce ONLY valid SVG markup (no fences, no explanations).
+    const instructions = `You are an SVG illustrator. Produce ONLY valid, standalone SVG markup (no fences, no explanations).
 Requirements:
 - Subject: cinematic board game box cover illustration.
 - Theme prompt: ${sanitizedPrompt}.
@@ -123,6 +167,8 @@ Requirements:
 - Ensure focal elements remain readable at thumbnail size.
 - Canvas: ${coverSize}px square viewBox 0 0 100 100.
 - Use layered gradients, shapes, and outlines; no external raster images.
+- Premium, polished finish: smooth curves, consistent stroke widths, soft shadows/glows, clean edges, no jagged artifacts.
+- Absolutely NO text, letters, or logos in the artwork.
 - Include depth cues (glow, shadow) to create a premium look.
 `;
     return callOpenAI({ prompt: instructions, signal });
@@ -153,19 +199,21 @@ Requirements:
     : `- Invent a distinctive motif so the piece feels bespoke rather than generic.`;
 
   const instructions = `
-You are an SVG generator. Produce ONLY a valid SVG markup snippet (no \`\`\` fences, no explanations).
+You are an SVG illustrator. Produce ONLY a valid, standalone SVG markup snippet (no \`\`\` fences, no explanations).
 Requirements:
 - Subject: ${role} game piece (${variant}).
 - Piece description: ${canonical}
 - Theme prompt: ${sanitizedPrompt}.
 ${styleCuesLine}
-- Geometry silhouette must clearly read as the role while showcasing the theme.
-- Avoid reusing plain geometric tokens; design something iconic for this theme.
+- Geometry silhouette must clearly read as the role while showcasing the theme. No amorphous blobs.
+- Build the form from multiple clear parts (head/body/base if applicable), with symmetry and stable proportions; avoid single-circle tokens.
 - ${thematicRule}
 - Colors: primary ${primaryColor} (main body), secondary ${secondaryColor} (optional trim), accent ${theme?.accent || '#ffd60a'}, outline ${theme?.outline || '#202020'}.
 - Geometry must stay identical for every variant/color; never change silhouette between players.
 - Canvas: ${size || 512}px square viewBox 0 0 100 100.
-- Keep SVG simple, flat, and lightweight. Use only shapes/paths/gradients. No external images.
+- Premium icon quality: layered gradients, subtle highlights/shadows, smooth curves, clean silhouettes, consistent stroke widths.
+- Absolutely NO text or letters in the art.
+- Keep SVG simple and lightweight. Use only shapes/paths/gradients. No external images.
 `;
 
   const svg = await callOpenAI({ prompt: instructions, signal });

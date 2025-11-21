@@ -5,6 +5,7 @@ import morgan from 'morgan';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
 import packsRouter from './routes/packs.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -17,6 +18,9 @@ const PORT = process.env.PORT || 7012;
 const PACKS_DIR =
   process.env.ASSETS_PACKS_DIR ||
   path.join(__dirname, 'assets', 'packs');
+const AVATAR_DIR =
+  process.env.ASSETS_AVATAR_DIR ||
+  path.join(__dirname, 'assets', 'avatars');
 const MIRROR_DIR = process.env.ASSETS_MIRROR_DIR || '';
 
 // make sure it exists
@@ -26,6 +30,13 @@ try {
   // eslint-disable-next-line no-console
   console.error('[assets] failed to create packs dir:', PACKS_DIR, e);
   process.exit(1);
+}
+
+try {
+  fs.mkdirSync(AVATAR_DIR, { recursive: true });
+} catch (e) {
+  // eslint-disable-next-line no-console
+  console.error('[assets] failed to create avatar dir:', AVATAR_DIR, e);
 }
 
 app.set('packsDir', PACKS_DIR);
@@ -43,11 +54,12 @@ if (MIRROR_DIR) {
 }
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '5mb' }));
 app.use(morgan('dev'));
 
 // Serve generated packs as /skins/<packId>/...
 app.use('/skins', express.static(PACKS_DIR, { fallthrough: true }));
+app.use('/avatars', express.static(AVATAR_DIR, { fallthrough: true }));
 
 // Health
 const health = (_req, res) => res.json({ ok: true, service: 'assets', packsDir: PACKS_DIR, uptime: process.uptime() });
@@ -59,6 +71,34 @@ app.get('/api/skins', (_req, res) => res.json({ ok: true, msg: 'skins API root',
 
 // Packs API
 app.use('/api/skins/packs', packsRouter);
+
+// Avatar upload (simple base64 -> file)
+app.post('/api/avatars', express.json({ limit: '6mb' }), (req, res) => {
+  try {
+    const rawBase64 = req.body?.avatar;
+    const userIdRaw = req.body?.userId;
+    const username = String(req.body?.username || 'user').toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'user';
+    const safeUserId = userIdRaw ? String(userIdRaw).replace(/[^a-zA-Z0-9_-]/g, '') : '';
+    if (!rawBase64 || typeof rawBase64 !== 'string' || !rawBase64.startsWith('data:image/')) {
+      res.status(400).json({ ok: false, error: 'Invalid avatar payload' });
+      return;
+    }
+    const mimeMatch = rawBase64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,/);
+    const ext = mimeMatch ? (mimeMatch[1].split('/')[1] || 'png') : 'png';
+    const safeExt = ext.toLowerCase().includes('jpeg') ? 'jpg' : ext.toLowerCase();
+    const baseName = safeUserId || username || (randomUUID?.() || Date.now());
+    const filename = `${baseName}.${safeExt}`;
+    const outputPath = path.join(AVATAR_DIR, filename);
+    const base64Data = rawBase64.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+    fs.writeFileSync(outputPath, base64Data, 'base64');
+    const publicPath = `/avatars/${filename}`;
+    res.status(201).json({ ok: true, url: publicPath, filename });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[avatars] upload failed', err?.message || err);
+    res.status(500).json({ ok: false, error: 'Avatar upload failed' });
+  }
+});
 
 // 404
 app.use((_req, res) => res.status(404).json({ ok: false, error: 'Not Found' }));

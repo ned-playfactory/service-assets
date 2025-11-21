@@ -19,6 +19,9 @@ src/public/skins/*
 # runtime-generated packs (persist via volume, never commit)
 assets/packs/
 
+# uploaded avatars
+src/assets/avatars/
+
 # mirrored packs for local inspection
 generated-packs/
 !generated-packs/.gitkeep

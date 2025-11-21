@@ -4,7 +4,7 @@ import path from 'path';
 import fs from 'fs/promises';
 import { nanoid } from 'nanoid';
 import Joi from 'joi';
-import { generateAISVG } from '../services/aiSvgGenerator.js';
+import { generateAISVG, isOpenAiSvgAvailable, getOpenAiSvgEnv } from '../services/aiSvgGenerator.js';
 import { generatePhotoSpriteSVG } from '../services/photoSpriteGenerator.js';
 import { sanitizePrompt } from '../lib/sanitizePrompt.js';
 import { renderChessPieceSVG, renderCoverSVG } from '../tri/svgTemplates.js';
@@ -233,6 +233,7 @@ const createSchema = Joi.object({
   resumePackId: Joi.string().allow('', null),
   reuseExistingPack: Joi.boolean().default(false),
   awaitClientAdvance: Joi.boolean().default(false),
+  vectorProvider: Joi.string().valid('auto', 'openai', 'local').default('auto'),
 });
 
 function fileUrl(base, ...p) {
@@ -489,6 +490,7 @@ router.post('/', async (req, res) => {
     resumePackId = null,
     reuseExistingPack = false,
     awaitClientAdvance = false,
+    vectorProvider = 'auto',
   } = value;
   const packsDir = req.app.get('packsDir');
   const mirrorDir = req.app.get('packsMirrorDir');
@@ -497,6 +499,9 @@ router.post('/', async (req, res) => {
   const resumePackIdClean = resumePackId && typeof resumePackId === 'string'
     ? resumePackId.trim()
     : null;
+  const providerPreference = renderStyle === 'vector' ? vectorProvider : 'auto';
+  const willUseOpenAI = renderStyle === 'vector' && isOpenAiSvgAvailable(providerPreference);
+  const openAiEnv = getOpenAiSvgEnv();
 
   let resumeSourceDir = null;
   if (resumePackIdClean) {
@@ -508,6 +513,14 @@ router.post('/', async (req, res) => {
     }
   }
   const allowReuseExisting = Boolean(reuseExistingPack && resumeSourceDir);
+
+  if (renderStyle === 'vector' && vectorProvider === 'openai' && !isOpenAiSvgAvailable('openai')) {
+    const msg = 'OpenAI SVG generation requested but OPENAI_API_KEY is not configured on the assets service.';
+    log('openai svg unavailable', { gameId, reason: msg });
+    emitProgress(progressChannel, 'error', { packId: null, gameId, error: msg });
+    res.status(400).json({ ok: false, error: msg });
+    return;
+  }
 
   if (pendingKey && pendingJobs.has(pendingKey)) {
     log('rejecting concurrent pack request', { gameId: pendingKey });
@@ -534,6 +547,8 @@ router.post('/', async (req, res) => {
     packsDir,
     stylePrompt: mergedPrompt || '<none>',
     renderStyle,
+    vectorProvider,
+    willUseOpenAI,
     resumePackId: resumePackIdClean || '<none>',
     reuseExisting: allowReuseExisting,
   });
@@ -544,8 +559,20 @@ router.post('/', async (req, res) => {
     size,
     roles: pieces?.map((p) => p.role) || [],
     renderStyle,
+    vectorProvider,
+    vectorProviderResolved: providerPreference,
+    willUseOpenAI,
+    openAiAvailable: openAiEnv.openAiAvailable,
     resumePackId: resumePackIdClean,
     reuseExisting: allowReuseExisting,
+  });
+  log('job start provider', {
+    gameId,
+    renderStyle,
+    vectorProvider,
+    providerPreference,
+    willUseOpenAI,
+    openAiEnv,
   });
 
   let gateChannel = null;
@@ -725,7 +752,12 @@ router.post('/', async (req, res) => {
           role: p.role,
           variant,
           status: 'loading',
-        });
+      vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
+      vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+      openai: renderStyle === 'vector' ? willUseOpenAI : null,
+      openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+      openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
+    });
 
         log('generate piece', {
           packId,
@@ -873,15 +905,28 @@ router.post('/', async (req, res) => {
               variant,
               promptPreview: promptForModel.slice(0, 160),
               size: pieceSize,
+              providerPreference,
+              openai: willUseOpenAI,
             });
-            svg = await generateAISVG({
-              role: p.role,
-              variant,
-              prompt: promptForModel,
-              size: pieceSize,
-              theme,
-              signal: upstreamAbortController.signal,
-            });
+            if (willUseOpenAI) {
+              svg = await generateAISVG({
+                role: p.role,
+                variant,
+                prompt: promptForModel,
+                size: pieceSize,
+                theme,
+                signal: upstreamAbortController.signal,
+                providerPreference,
+              });
+            } else {
+              log('vector ai skipped openai (provider resolved to local)', {
+                packId,
+                role: p.role,
+                variant,
+                providerPreference,
+              });
+              svg = null;
+            }
             if (cancelled) {
               log('vector svg result discarded due to cancellation', {
                 packId,
@@ -989,6 +1034,11 @@ router.post('/', async (req, res) => {
           role: p.role,
           variant,
           status: 'missing',
+          vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
+          vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+          openai: renderStyle === 'vector' ? willUseOpenAI : null,
+          openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+          openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
         });
         if (gameId) {
           updateJobPieceState(gameId, normalizedRole, variant, { status: 'missing' });
@@ -1018,6 +1068,11 @@ router.post('/', async (req, res) => {
           url: files[p.role][variant],
           status: finalStatus,
           prompt: promptForModel,
+          vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
+          vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+          openai: renderStyle === 'vector' ? willUseOpenAI : null,
+          openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+          openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
         });
 
         if (gameId) {
@@ -1080,6 +1135,11 @@ router.post('/', async (req, res) => {
       manifestUrl: `/skins/${packId}/manifest.json`,
       files,
       renderStyle,
+      vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
+      vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+      openai: renderStyle === 'vector' ? willUseOpenAI : null,
+      openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+      openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
       prompts: promptSnapshot,
     });
     closeChannel(progressChannel);
