@@ -229,6 +229,17 @@ const createSchema = Joi.object({
         .optional(),
     })
   ).min(1).default([{ role: 'token', variants: ['p1','p2'] }]),
+  boards: Joi.array().items(
+    Joi.object({
+      id: Joi.string().required(),
+      name: Joi.string().allow('', null),
+      background: Joi.string().allow('', null),
+      backgroundImage: Joi.string().allow('', null),
+      tileLight: Joi.string().allow('', null),
+      tileDark: Joi.string().allow('', null),
+      grid: Joi.string().allow('', null),
+    })
+  ).default([]),
   size: Joi.number().integer().min(64).max(1024).default(512), // SVG viewBox (square)
   resumePackId: Joi.string().allow('', null),
   reuseExistingPack: Joi.boolean().default(false),
@@ -486,6 +497,7 @@ router.post('/', async (req, res) => {
     renderStyle = 'vector',
     theme,
     pieces,
+    boards,
     size,
     resumePackId = null,
     reuseExistingPack = false,
@@ -539,11 +551,13 @@ router.post('/', async (req, res) => {
   const packId = `pack_${Date.now()}_${nanoid(6)}`;
   const baseDir = path.join(packsDir, packId);
   const piecesDir = path.join(baseDir, 'pieces');
+  const boardsDir = path.join(baseDir, 'boards');
   log('POST create pack', {
     packId,
     gameId,
     size,
     roles: pieces?.map((p) => p.role).join(',') || '<none>',
+    boards: Array.isArray(boards) ? boards.map((b) => b?.id || '?').join(',') : '<none>',
     packsDir,
     stylePrompt: mergedPrompt || '<none>',
     renderStyle,
@@ -558,6 +572,7 @@ router.post('/', async (req, res) => {
     gameId,
     size,
     roles: pieces?.map((p) => p.role) || [],
+    boards: Array.isArray(boards) ? boards.map((b) => b?.id).filter(Boolean) : [],
     renderStyle,
     vectorProvider,
     vectorProviderResolved: providerPreference,
@@ -592,8 +607,24 @@ router.post('/', async (req, res) => {
 
     await fs.mkdir(baseDir, { recursive: true });
     await fs.mkdir(piecesDir, { recursive: true });
+    await fs.mkdir(boardsDir, { recursive: true });
 
     const files = {};
+    const boardsMap = Array.isArray(boards)
+      ? boards.reduce((acc, b) => {
+          const id = String(b?.id || '').trim();
+          if (!id) return acc;
+          acc[id] = {
+            id,
+            name: b?.name,
+            background: b?.background || b?.backgroundImage || null,
+            tileLight: b?.tileLight || null,
+            tileDark: b?.tileDark || null,
+            grid: b?.grid || null,
+          };
+          return acc;
+        }, {})
+      : {};
     const manifestCreatedAt = new Date().toISOString();
     const buildManifest = (complete = false) => ({
       packId,
@@ -603,6 +634,7 @@ router.post('/', async (req, res) => {
       theme,
       size,
       files: sortFilesMap(files),
+      boards: boardsMap,
       renderStyle,
       complete,
     });
@@ -642,6 +674,42 @@ router.post('/', async (req, res) => {
     }
 
     await writeManifestPartial(false);
+
+    // Generate simple procedural board assets (SVG) if boards requested
+    if (Object.keys(boardsMap).length) {
+      const writeBoardAsset = async (boardId, name) => {
+        const boardPath = path.join(boardsDir, boardId);
+        await fs.mkdir(boardPath, { recursive: true });
+        const light = theme?.p1Color || '#e8e8e8';
+        const dark = theme?.p2Color || '#d8d8d8';
+        const accent = theme?.accent || '#ffd60a';
+        const outline = theme?.outline || '#202020';
+        const backgroundSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${light}" stop-opacity="0.85"/><stop offset="100%" stop-color="${dark}" stop-opacity="0.9"/></linearGradient></defs><rect width="1024" height="1024" fill="url(#g)"/><circle cx="180" cy="180" r="120" fill="${accent}" opacity="0.12"/><circle cx="860" cy="220" r="140" fill="${outline}" opacity="0.08"/><rect x="260" y="520" width="520" height="320" rx="24" fill="${outline}" opacity="0.05"/></svg>`;
+        const tileLightSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${light}" stroke="${outline}" stroke-width="2" opacity="0.5"/></svg>`;
+        const tileDarkSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${dark}" stroke="${outline}" stroke-width="2" opacity="0.55"/><circle cx="28" cy="28" r="12" fill="${accent}" opacity="0.2"/></svg>`;
+        const bgRel = `/skins/${packId}/boards/${boardId}/background.svg`;
+        const lightRel = `/skins/${packId}/boards/${boardId}/tileLight.svg`;
+        const darkRel = `/skins/${packId}/boards/${boardId}/tileDark.svg`;
+        await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
+        await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
+        await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
+        await mirrorWrite(mirrorDir, path.join(packId, 'boards', boardId, 'background.svg'), backgroundSvg);
+        await mirrorWrite(mirrorDir, path.join(packId, 'boards', boardId, 'tileLight.svg'), tileLightSvg);
+        await mirrorWrite(mirrorDir, path.join(packId, 'boards', boardId, 'tileDark.svg'), tileDarkSvg);
+        boardsMap[boardId] = {
+          ...(boardsMap[boardId] || {}),
+          name,
+          background: bgRel,
+          tileLight: lightRel,
+          tileDark: darkRel,
+        };
+      };
+
+      for (const [boardId, meta] of Object.entries(boardsMap)) {
+        await writeBoardAsset(boardId, meta?.name);
+      }
+      await writeManifestPartial(false);
+    }
 
     const orderedPieces = Array.isArray(pieces)
       ? [...pieces].sort((a, b) => {
