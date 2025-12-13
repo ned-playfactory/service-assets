@@ -789,6 +789,12 @@ router.post('/', async (req, res) => {
           const boardPath = path.join(baseDir, boardId, 'board');
           await fs.mkdir(boardPath, { recursive: true });
           
+          log('writeBoardAsset start', { 
+            boardId, 
+            resumeSourceDir: resumeSourceDir ? 'exists' : 'null',
+            resumeSourceDirPath: resumeSourceDir,
+          });
+          
           // CRITICAL: Always copy existing board assets when resumeSourceDir exists
           // This preserves board-1 assets when adding board-2
           const shouldCopyExisting = resumeSourceDir;
