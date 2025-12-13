@@ -21,7 +21,6 @@ const PACKS_DIR =
 const AVATAR_DIR =
   process.env.ASSETS_AVATAR_DIR ||
   path.join(__dirname, 'assets', 'avatars');
-const MIRROR_DIR = process.env.ASSETS_MIRROR_DIR || '';
 
 // make sure it exists
 try {
@@ -40,18 +39,6 @@ try {
 }
 
 app.set('packsDir', PACKS_DIR);
-if (MIRROR_DIR) {
-  try {
-    fs.mkdirSync(MIRROR_DIR, { recursive: true });
-    app.set('packsMirrorDir', MIRROR_DIR);
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.warn('[assets] failed to init mirror dir', MIRROR_DIR, err?.message || err);
-    app.set('packsMirrorDir', null);
-  }
-} else {
-  app.set('packsMirrorDir', null);
-}
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '5mb' }));

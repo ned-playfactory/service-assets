@@ -102,6 +102,45 @@ function serializeJobState(state) {
   };
 }
 
+/**
+ * Auto-cleanup old packs for a game.
+ * Keeps the latest N packs per gameId and deletes older ones.
+ * Call after a successful pack generation.
+ */
+async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2) {
+  if (!gameId) return;
+  try {
+    const items = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
+    const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
+    
+    // Parse timestamps and group by gameId metadata (crude but works: packs are named pack_<timestamp>_<gameId>)
+    const gamePacksInfo = allPacks
+      .filter(name => name.startsWith('pack_'))
+      .map(name => {
+        const parts = name.split('_');
+        const timestamp = parts.length > 1 ? Number(parts[1]) : 0;
+        return { name, timestamp };
+      })
+      .sort((a, b) => b.timestamp - a.timestamp);
+    
+    // Keep the latest `keepLatest` packs, delete the rest
+    if (gamePacksInfo.length > keepLatest) {
+      const toDelete = gamePacksInfo.slice(keepLatest);
+      for (const { name } of toDelete) {
+        const packPath = path.join(packsDir, name);
+        try {
+          await fs.rm(packPath, { recursive: true, force: true });
+          log('auto-cleaned old pack', { packId: name });
+        } catch (err) {
+          log('failed to auto-clean pack', { packId: name, error: err?.message || err });
+        }
+      }
+    }
+  } catch (err) {
+    log('cleanup old packs failed', { gameId, error: err?.message || err });
+  }
+}
+
 function initAdvanceGate(channel) {
   if (!channel) return null;
   const key = String(channel);
@@ -268,18 +307,6 @@ router.get('/progress/:channelId', (req, res) => {
   registerClient(channelId, res);
 });
 
-async function mirrorWrite(root, relPath, contents) {
-  if (!root) return;
-  const dest = path.join(root, relPath);
-  try {
-    await fs.mkdir(path.dirname(dest), { recursive: true });
-    await fs.writeFile(dest, contents, 'utf8');
-    log('mirrored asset', { dest });
-  } catch (err) {
-    log('mirror write failed', { dest, error: err?.message || err });
-  }
-}
-
 function sortFilesMap(files = {}) {
   const sorted = {};
   Object.keys(files)
@@ -293,6 +320,31 @@ function sortFilesMap(files = {}) {
           sortedVariants[variant] = variants[variant];
         });
       sorted[role] = sortedVariants;
+  });
+  return sorted;
+}
+
+function sortBoardAssets(boardAssets = {}) {
+  const sorted = {};
+  Object.keys(boardAssets)
+    .sort((a, b) => a.localeCompare(b))
+    .forEach((boardId) => {
+      const entry = boardAssets[boardId] || {};
+      const tokens = entry.tokens || entry.pieces || {};
+      const sortedTokens = {};
+      Object.keys(tokens)
+        .sort((a, b) => a.localeCompare(b))
+        .forEach((variant) => {
+          sortedTokens[variant] = tokens[variant];
+        });
+      sorted[boardId] = {
+        ...(entry.boardPreview ? { boardPreview: entry.boardPreview } : {}),
+        ...(entry.cover ? { cover: entry.cover } : {}),
+        ...(entry.background ? { background: entry.background } : {}),
+        ...(entry.tileLight ? { tileLight: entry.tileLight } : {}),
+        ...(entry.tileDark ? { tileDark: entry.tileDark } : {}),
+        ...(Object.keys(sortedTokens).length ? { tokens: sortedTokens } : {}),
+      };
     });
   return sorted;
 }
@@ -322,16 +374,9 @@ function resolveVariantPrompt(variantPrompts, variant) {
   return null;
 }
 
-async function writeManifestSnapshot(baseDir, mirrorDir, packId, manifest) {
-  if (!manifest) return;
-  const payload = JSON.stringify(manifest, null, 2);
-  const manifestPath = path.join(baseDir, 'manifest.json');
-  try {
-    await fs.writeFile(manifestPath, payload, 'utf8');
-  } catch (err) {
-    log('manifest write failed', { packId, error: err?.message || err });
-  }
-  await mirrorWrite(mirrorDir, path.join(packId, 'manifest.json'), payload);
+async function writeManifestSnapshot(baseDir, packId, manifest) {
+  // Manifest persistence disabled for POC — assets are sourced directly from script state.
+  return;
 }
 
 router.get('/', async (req, res) => {
@@ -474,11 +519,9 @@ router.get('/:id', async (req, res) => {
   const packsDir = req.app.get('packsDir');
   const packId = req.params.id;
   try {
-    const manifestPath = path.join(packsDir, packId, 'manifest.json');
-    log('GET pack manifest', { packId, manifestPath });
-    const buf = await fs.readFile(manifestPath, 'utf8');
-    const manifest = JSON.parse(buf);
-    res.json({ ok: true, packId, manifest });
+    // Manifest endpoint deprecated; respond with 404 to avoid stale data usage.
+    log('manifest endpoint deprecated', { packId });
+    res.status(404).json({ ok: false, error: 'Manifest disabled for this service' });
   } catch {
     log('pack not found', packId);
     res.status(404).json({ ok: false, error: 'Pack not found' });
@@ -505,7 +548,6 @@ router.post('/', async (req, res) => {
     vectorProvider = 'auto',
   } = value;
   const packsDir = req.app.get('packsDir');
-  const mirrorDir = req.app.get('packsMirrorDir');
   const mergedPrompt = [gameName, stylePrompt].map((s) => (s || '').trim()).filter(Boolean).join(' — ');
   const pendingKey = gameId ? String(gameId) : null;
   const resumePackIdClean = resumePackId && typeof resumePackId === 'string'
@@ -550,8 +592,6 @@ router.post('/', async (req, res) => {
 
   const packId = `pack_${Date.now()}_${nanoid(6)}`;
   const baseDir = path.join(packsDir, packId);
-  const piecesDir = path.join(baseDir, 'pieces');
-  const boardsDir = path.join(baseDir, 'boards');
   log('POST create pack', {
     packId,
     gameId,
@@ -565,6 +605,18 @@ router.post('/', async (req, res) => {
     willUseOpenAI,
     resumePackId: resumePackIdClean || '<none>',
     reuseExisting: allowReuseExisting,
+  });
+  log('DETAILED REQUEST SHAPE', {
+    packId,
+    gameId,
+    boardsArray: JSON.stringify(boards),
+    piecesArray: JSON.stringify(pieces),
+  });
+  log('DETAILED REQUEST SHAPE', {
+    packId,
+    gameId,
+    boardsArray: JSON.stringify(boards),
+    piecesArray: JSON.stringify(pieces),
   });
 
   emitProgress(progressChannel, 'start', {
@@ -606,10 +658,11 @@ router.post('/', async (req, res) => {
     upstreamAbortController = new AbortController();
 
     await fs.mkdir(baseDir, { recursive: true });
-    await fs.mkdir(piecesDir, { recursive: true });
-    await fs.mkdir(boardsDir, { recursive: true });
+    await fs.mkdir(baseDir, { recursive: true });
 
     const files = {};
+    const boardAssets = {};
+    // legacy write helpers to keep old paths alive until frontend fully per-board
     const boardsMap = Array.isArray(boards)
       ? boards.reduce((acc, b) => {
           const id = String(b?.id || '').trim();
@@ -625,22 +678,35 @@ router.post('/', async (req, res) => {
           return acc;
         }, {})
       : {};
-    const manifestCreatedAt = new Date().toISOString();
-    const buildManifest = (complete = false) => ({
+    log('BOARDS MAP CONSTRUCTED', {
       packId,
       gameId,
-      createdAt: manifestCreatedAt,
-      updatedAt: new Date().toISOString(),
-      theme,
-      size,
-      files: sortFilesMap(files),
-      boards: boardsMap,
-      renderStyle,
-      complete,
+      boardsMapKeys: Object.keys(boardsMap),
+      boardsMapShape: JSON.stringify(boardsMap),
     });
-    const writeManifestPartial = async (complete = false) => {
-      await writeManifestSnapshot(baseDir, mirrorDir, packId, buildManifest(complete));
-    };
+    log('BOARDS MAP CONSTRUCTED', {
+      packId,
+      gameId,
+      boardsMapKeys: Object.keys(boardsMap),
+      boardsMapShape: JSON.stringify(boardsMap),
+    });
+    // Manifest writing disabled; keep placeholders for future reactivation.
+    const writeManifestPartial = async () => {};
+    const orderedPieces = Array.isArray(pieces)
+      ? pieces
+          .filter(Boolean)
+          .map((p) => {
+            const role = String(p.role || '').toLowerCase();
+            const baseVariants =
+              Array.isArray(p.variants) && p.variants.length
+                ? p.variants
+                : [role === 'cover' ? 'main' : 'p1'];
+            const variants = baseVariants
+              .map((v) => String(v || '').toLowerCase())
+              .filter(Boolean);
+            return { ...p, variants };
+          })
+      : [];
     let cancelled = false;
     const markCancelled = (reason = 'requested') => {
       if (cancelled) return;
@@ -675,76 +741,30 @@ router.post('/', async (req, res) => {
 
     await writeManifestPartial(false);
 
-    // Generate simple procedural board assets (SVG) if boards requested
-    if (Object.keys(boardsMap).length) {
-      const writeBoardAsset = async (boardId, name) => {
-        const boardPath = path.join(boardsDir, boardId);
-        await fs.mkdir(boardPath, { recursive: true });
-        const light = theme?.p1Color || '#e8e8e8';
-        const dark = theme?.p2Color || '#d8d8d8';
-        const accent = theme?.accent || '#ffd60a';
-        const outline = theme?.outline || '#202020';
-        const backgroundSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${light}" stop-opacity="0.85"/><stop offset="100%" stop-color="${dark}" stop-opacity="0.9"/></linearGradient></defs><rect width="1024" height="1024" fill="url(#g)"/><circle cx="180" cy="180" r="120" fill="${accent}" opacity="0.12"/><circle cx="860" cy="220" r="140" fill="${outline}" opacity="0.08"/><rect x="260" y="520" width="520" height="320" rx="24" fill="${outline}" opacity="0.05"/></svg>`;
-        const tileLightSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${light}" stroke="${outline}" stroke-width="2" opacity="0.5"/></svg>`;
-        const tileDarkSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${dark}" stroke="${outline}" stroke-width="2" opacity="0.55"/><circle cx="28" cy="28" r="12" fill="${accent}" opacity="0.2"/></svg>`;
-        const bgRel = `/skins/${packId}/boards/${boardId}/background.svg`;
-        const lightRel = `/skins/${packId}/boards/${boardId}/tileLight.svg`;
-        const darkRel = `/skins/${packId}/boards/${boardId}/tileDark.svg`;
-        await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
-        await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
-        await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
-        await mirrorWrite(mirrorDir, path.join(packId, 'boards', boardId, 'background.svg'), backgroundSvg);
-        await mirrorWrite(mirrorDir, path.join(packId, 'boards', boardId, 'tileLight.svg'), tileLightSvg);
-        await mirrorWrite(mirrorDir, path.join(packId, 'boards', boardId, 'tileDark.svg'), tileDarkSvg);
-        boardsMap[boardId] = {
-          ...(boardsMap[boardId] || {}),
-          name,
-          background: bgRel,
-          tileLight: lightRel,
-          tileDark: darkRel,
-        };
-      };
-
-      for (const [boardId, meta] of Object.entries(boardsMap)) {
-        await writeBoardAsset(boardId, meta?.name);
-      }
-      await writeManifestPartial(false);
-    }
-
-    const orderedPieces = Array.isArray(pieces)
-      ? [...pieces].sort((a, b) => {
-          const roleA = String(a?.role || '').toLowerCase();
-          const roleB = String(b?.role || '').toLowerCase();
-          if (roleA === 'cover' && roleB !== 'cover') return -1;
-          if (roleB === 'cover' && roleA !== 'cover') return 1;
-          return 0;
-        })
-      : pieces;
-
-    if (gameId) {
-      seedJobState(gameId, {
-        packId,
-        renderStyle,
-        baseUrl: `/skins/${packId}`,
-        manifestUrl: `/skins/${packId}/manifest.json`,
-        progressChannel,
-        resumePackId: resumePackIdClean,
-        pieces: buildPiecesState(orderedPieces),
-        active: true,
-      });
-    }
-
-    const totalPieceCount = Array.isArray(orderedPieces)
-      ? orderedPieces.reduce(
-          (sum, piece) =>
-            sum +
-            (Array.isArray(piece?.variants) && piece.variants.length
-              ? piece.variants.length
-              : 0),
-          0,
-        )
-      : 0;
+    const boardIds = Object.keys(boardsMap).length ? Object.keys(boardsMap) : ['board-1'];
+    const totalPieceCount =
+      boardIds.length *
+      orderedPieces.reduce(
+        (sum, piece) => sum + (Array.isArray(piece.variants) ? piece.variants.length : 0),
+        0,
+      );
     let remainingPieces = totalPieceCount;
+    
+    log('GENERATION LOOP STARTING', {
+      packId,
+      gameId,
+      boardIds: JSON.stringify(boardIds),
+      orderedPieces: JSON.stringify(orderedPieces.map(p => ({ role: p.role, variants: p.variants }))),
+      totalPieceCount,
+    });
+    
+    log('GENERATION LOOP STARTING', {
+      packId,
+      gameId,
+      boardIds: JSON.stringify(boardIds),
+      orderedPieces: JSON.stringify(orderedPieces.map(p => ({ role: p.role, variants: p.variants }))),
+      totalPieceCount,
+    });
 
     const awaitAdvanceIfNeeded = async () => {
       if (!gateChannel || cancelled) return true;
@@ -753,11 +773,7 @@ router.post('/', async (req, res) => {
       if (waitResult?.type === 'timeout') {
         log('client advance timeout', { packId, gameId });
         markCancelled('client-advance-timeout');
-        emitProgress(progressChannel, 'cancelled', {
-          packId,
-          gameId,
-          reason: 'client-timeout',
-        });
+        emitProgress(progressChannel, 'cancelled', { packId, gameId, reason: 'client-timeout' });
         return false;
       }
       if (waitResult?.type === 'cancelled') {
@@ -767,397 +783,406 @@ router.post('/', async (req, res) => {
       return true;
     };
 
-    for (const p of orderedPieces) {
-      if (cancelled) break;
-      const roleDir = path.join(piecesDir, p.role);
-      await fs.mkdir(roleDir, { recursive: true });
+    // Generate simple procedural board assets (SVG) for boards (default at least one)
+      if (boardIds.length) {
+        const writeBoardAsset = async (boardId, name) => {
+          const boardPath = path.join(baseDir, boardId, 'board');
+          await fs.mkdir(boardPath, { recursive: true });
+          const light = theme?.p1Color || '#e8e8e8';
+        const dark = theme?.p2Color || '#d8d8d8';
+        const accent = theme?.accent || '#ffd60a';
+        const outline = theme?.outline || '#202020';
+        const backgroundSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${light}" stop-opacity="0.85"/><stop offset="100%" stop-color="${dark}" stop-opacity="0.9"/></linearGradient></defs><rect width="1024" height="1024" fill="url(#g)"/><circle cx="180" cy="180" r="120" fill="${accent}" opacity="0.12"/><circle cx="860" cy="220" r="140" fill="${outline}" opacity="0.08"/><rect x="260" y="520" width="520" height="320" rx="24" fill="${outline}" opacity="0.05"/></svg>`;
+        const tileLightSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${light}" stroke="${outline}" stroke-width="2" opacity="0.5"/></svg>`;
+        const tileDarkSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${dark}" stroke="${outline}" stroke-width="2" opacity="0.55"/><circle cx="28" cy="28" r="12" fill="${accent}" opacity="0.2"/></svg>`;
+        const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
+        const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
+        const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
+        const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+        await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
+          await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
+          await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
+          await fs.writeFile(path.join(boardPath, 'preview.svg'), backgroundSvg, 'utf8');
+          files.board ||= {};
+          files.board[boardId] = boardPreviewRel;
+          boardAssets[boardId] = {
+            ...(boardAssets[boardId] || {}),
+            boardPreview: boardPreviewRel,
+            background: bgRel,
+            tileLight: lightRel,
+            tileDark: darkRel,
+          };
+          boardsMap[boardId] = {
+            ...(boardsMap[boardId] || {}),
+            id: boardId,
+            name: name || boardsMap[boardId]?.name || boardId,
+            background: bgRel,
+            tileLight: lightRel,
+            tileDark: darkRel,
+            preview: boardPreviewRel,
+          };
+      };
 
-      for (const vRaw of p.variants) {
+      for (const boardId of boardIds) {
+        if (cancelled) break;
+        await writeBoardAsset(boardId, boardsMap[boardId]?.name);
+      }
+      
+      log('BOARD BACKGROUNDS GENERATED', {
+        packId,
+        gameId,
+        boardAssetsAfterBackgrounds: JSON.stringify(boardAssets),
+      });
+
+      log('STARTING PIECES GENERATION', {
+        packId,
+        gameId,
+        boardIds: JSON.stringify(boardIds),
+        boardAssetsBeforeLoop: JSON.stringify(boardAssets),
+      });
+      
+      for (const boardId of boardIds) {
+        if (cancelled) break;
+        const boardRoot = path.join(baseDir, boardId);
+        log('GENERATING FOR BOARD', {
+          packId,
+          gameId,
+          boardId,
+          boardAssetsCurrentState: JSON.stringify(boardAssets[boardId] || null),
+        });
+        for (const p of orderedPieces) {
         if (cancelled) break;
         const normalizedRole = String(p.role || '').toLowerCase();
-        const isCover = normalizedRole === 'cover';
-        const variant = String(vRaw || (isCover ? 'main' : 'p1')).toLowerCase();
-        const color = variant === 'p1' ? theme.p1Color : (variant === 'p2' ? theme.p2Color : theme.accent);
-        const pieceSize = isCover ? Math.max(size, 768) : size;
-        const filename = `${variant}.svg`;
-        const filePath = path.join(roleDir, filename);
-        const reuseSourcePath = allowReuseExisting && resumeSourceDir
-          ? path.join(resumeSourceDir, 'pieces', p.role, filename)
-          : null;
-        let svg = null;
-        const variantPromptOverride = resolveVariantPrompt(p.variantPrompts, variant);
-        const promptSegments = (variantPromptOverride
-          ? [variantPromptOverride]
-          : [mergedPrompt, p.prompt]
-        ).map((s) => (s || '').trim());
-        const piecePrompt = promptSegments.filter(Boolean).join(' — ');
-        const promptForAI = piecePrompt || mergedPrompt || variantPromptOverride || '';
-        const { prompt: safePrompt, replacements } = sanitizePrompt(promptForAI);
-        const promptForModel = safePrompt || promptForAI;
-        const wantsPhotoreal = renderStyle === 'photoreal';
+        const isCoverRole = normalizedRole === 'cover';
+        const roleDir = isCoverRole
+          ? path.join(boardRoot, 'cover')
+          : path.join(boardRoot, 'pieces', p.role);
+        await fs.mkdir(roleDir, { recursive: true });
 
-        if (gameId) {
-          updateJobPieceState(gameId, normalizedRole, variant, { status: 'loading', prompt: promptForModel });
-        }
+        for (const vRaw of p.variants) {
+          if (cancelled) break;
+          const isCover = isCoverRole;
+          const variant = String(isCover ? 'main' : vRaw || 'p1').toLowerCase();
+          const color =
+            variant === 'p1'
+              ? theme.p1Color
+              : variant === 'p2'
+              ? theme.p2Color
+              : theme.accent;
+          const pieceSize = isCover ? Math.max(size, 768) : size;
+          const filename = `${variant}.svg`;
+          const filePath = path.join(roleDir, filename);
+          const reuseSourcePath =
+            allowReuseExisting && resumeSourceDir
+              ? path.join(
+                  resumeSourceDir,
+                  boardId,
+                  isCover ? 'cover' : path.join('pieces', p.role),
+                  filename,
+                )
+              : null;
+          let svg = null;
+          const variantPromptOverride = resolveVariantPrompt(p.variantPrompts, variant);
+          const promptSegments = (variantPromptOverride ? [variantPromptOverride] : [mergedPrompt, p.prompt]).map((s) =>
+            (s || '').trim(),
+          );
+          const piecePrompt = promptSegments.filter(Boolean).join(' — ');
+          const promptForAI = piecePrompt || mergedPrompt || variantPromptOverride || '';
+          const { prompt: safePrompt, replacements } = sanitizePrompt(promptForAI);
+          const promptForModel = safePrompt || promptForAI;
+          const wantsPhotoreal = renderStyle === 'photoreal';
 
-        if (replacements.length && Array.isArray(replacements) && replacements.length > 0) {
-          log('prompt sanitized', {
+          if (gameId) {
+            updateJobPieceState(gameId, normalizedRole, variant, { status: 'loading', prompt: promptForModel });
+          }
+
+          if (replacements.length && Array.isArray(replacements) && replacements.length > 0) {
+            log('prompt sanitized', { packId, role: p.role, variant, replacements });
+            emitProgress(progressChannel, 'notice', { packId, role: p.role, variant, replacements });
+          }
+
+          emitProgress(progressChannel, 'piece-start', {
             packId,
             role: p.role,
             variant,
-            replacements,
+            status: 'loading',
+            vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
+            vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+            openai: renderStyle === 'vector' ? willUseOpenAI : null,
+            openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+            openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
           });
-          emitProgress(progressChannel, 'notice', {
+
+          log('generate piece', {
             packId,
             role: p.role,
             variant,
-            replacements,
+            renderStyle,
+            prompt: (promptForModel || '').slice(0, 160),
           });
-        }
 
-        emitProgress(progressChannel, 'piece-start', {
-          packId,
-          role: p.role,
-          variant,
-          status: 'loading',
-      vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
-      vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
-      openai: renderStyle === 'vector' ? willUseOpenAI : null,
-      openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
-      openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
-    });
+          let finalStatus = 'ready';
 
-        log('generate piece', {
-          packId,
-          role: p.role,
-          variant,
-          renderStyle,
-          prompt: (promptForModel || '').slice(0, 160),
-        });
+          if (reuseSourcePath) {
+            try {
+              const existingSvg = await fs.readFile(reuseSourcePath, 'utf8');
+              await fs.writeFile(filePath, existingSvg, 'utf8');
 
-        let finalStatus = 'ready';
+              const rolePath = isCover ? 'cover' : `pieces/${p.role}`;
+              const urlPath = `/skins/${packId}/${boardId}/${rolePath}/${filename}`;
+              files[p.role] ||= {};
+              files[p.role][`${boardId}-${variant}`] = urlPath;
+              boardAssets[boardId] ||= {};
+              if (isCover) {
+                boardAssets[boardId].cover = urlPath;
+              } else {
+                boardAssets[boardId].tokens ||= {};
+                boardAssets[boardId].tokens[variant] = urlPath;
+                // No longer populate pieces - tokens is sufficient
+              }
 
-        if (reuseSourcePath) {
-          try {
-            const existingSvg = await fs.readFile(reuseSourcePath, 'utf8');
-            await fs.writeFile(filePath, existingSvg, 'utf8');
-            await mirrorWrite(mirrorDir, path.join(packId, 'pieces', p.role, filename), existingSvg);
-
-            files[p.role] ||= {};
-            files[p.role][variant] = `/skins/${packId}/pieces/${p.role}/${filename}`;
-
-            emitProgress(progressChannel, 'piece', {
-              packId,
-              role: p.role,
-              variant,
-              url: files[p.role][variant],
-              status: finalStatus,
-              reused: true,
-              resumePackId: resumePackIdClean,
-              prompt: promptForModel,
-            });
-            if (gameId) {
-              updateJobPieceState(gameId, normalizedRole, variant, {
+              emitProgress(progressChannel, 'piece', {
+                packId,
+                role: p.role,
+                variant,
+                url: urlPath,
                 status: finalStatus,
-                url: files[p.role][variant],
                 reused: true,
+                resumePackId: resumePackIdClean,
                 prompt: promptForModel,
               });
-            }
-            await writeManifestPartial(false);
-            log('reused existing asset', {
-              packId,
-              role: p.role,
-              variant,
-              resumePackId: resumePackIdClean,
-            });
-            remainingPieces -= 1;
-            const continueAfterReuse = await awaitAdvanceIfNeeded();
-            if (!continueAfterReuse) {
-              break;
-            }
-            continue;
-          } catch (reuseErr) {
-            if (reuseErr?.code !== 'ENOENT') {
-              log('reuse existing asset failed', {
-                packId,
-                role: p.role,
-                variant,
-                resumePackId: resumePackIdClean,
-                error: reuseErr?.message || reuseErr,
-              });
-            }
-          }
-        }
-
-        if (wantsPhotoreal) {
-          if (!promptForModel) {
-            throw new Error(`Photoreal rendering requires a prompt for ${p.role}/${variant}`);
-          }
-          try {
-            log('photo sprite request', {
-              packId,
-              role: p.role,
-              variant,
-              promptPreview: promptForModel.slice(0, 160),
-              size: pieceSize,
-            });
-            svg = await generatePhotoSpriteSVG({
-              role: p.role,
-              variant,
-              prompt: promptForModel,
-              size: pieceSize,
-              theme,
-              signal: upstreamAbortController.signal,
-            });
-            if (cancelled) {
-              log('photo sprite result discarded due to cancellation', {
-                packId,
-                role: p.role,
-                variant,
-              });
-              break;
-            }
-            if (svg) {
-              const hasPngImage = /data:image\/png;base64,/i.test(svg);
-              log('photo sprite success', {
-                packId,
-                role: p.role,
-                variant,
-                hasPngImage,
-                length: svg.length,
-              });
-              if (!hasPngImage) {
-                log('photo sprite warning', {
+              if (gameId) {
+                updateJobPieceState(gameId, normalizedRole, variant, {
+                  status: finalStatus,
+                  url: urlPath,
+                  reused: true,
+                  prompt: promptForModel,
+                });
+              }
+              await writeManifestPartial(false);
+              log('reused existing asset', { packId, role: p.role, variant, resumePackId: resumePackIdClean });
+              remainingPieces -= 1;
+              const continueAfterReuse = await awaitAdvanceIfNeeded();
+              if (!continueAfterReuse) {
+                break;
+              }
+              continue;
+            } catch (reuseErr) {
+              if (reuseErr?.code !== 'ENOENT') {
+                log('reuse existing asset failed', {
                   packId,
                   role: p.role,
                   variant,
-                  message: 'SVG returned without embedded PNG payload.',
+                  resumePackId: resumePackIdClean,
+                  error: reuseErr?.message || reuseErr,
                 });
               }
             }
-          } catch (err) {
-            if (cancelled || upstreamAbortController.signal.aborted || err?.message?.includes('cancelled')) {
-              cancelled = true;
-              break;
-            }
-            log('photo sprite generation failed', err?.message || err);
-            emitProgress(progressChannel, 'piece-error', {
-              packId,
-              role: p.role,
-              variant,
-              error: err?.message || err,
-            });
-            throw new Error(
-              `Photoreal generation failed for ${p.role}/${variant}: ${err?.message || err}`
-            );
           }
-          if (!svg) {
-            log('photo sprite generation returned empty', { role: p.role, variant });
-            emitProgress(progressChannel, 'piece-error', {
-              packId,
-              role: p.role,
-              variant,
-              error: `Photoreal generation failed for ${p.role}/${variant}`,
-            });
-            if (gameId) {
-              updateJobPieceState(gameId, normalizedRole, variant, { status: 'error' });
+
+          if (wantsPhotoreal) {
+            if (!promptForModel) {
+              throw new Error(`Photoreal rendering requires a prompt for ${p.role}/${variant}`);
             }
-            throw new Error(`Photoreal generation failed for ${p.role}/${variant}`);
-          }
-        } else {
-          if (promptForModel) {
-            log('vector ai request', {
-              packId,
-              role: p.role,
-              variant,
-              promptPreview: promptForModel.slice(0, 160),
-              size: pieceSize,
-              providerPreference,
-              openai: willUseOpenAI,
-            });
-            if (willUseOpenAI) {
-              svg = await generateAISVG({
+            try {
+              log('photo sprite request', {
+                packId,
+                role: p.role,
+                variant,
+                promptPreview: promptForModel.slice(0, 160),
+                size: pieceSize,
+                theme,
+              });
+              svg = await generatePhotoSpriteSVG({
                 role: p.role,
                 variant,
                 prompt: promptForModel,
                 size: pieceSize,
                 theme,
                 signal: upstreamAbortController.signal,
-                providerPreference,
               });
+              if (cancelled) {
+                log('photo sprite result discarded due to cancellation', { packId, role: p.role, variant });
+                break;
+              }
+              if (svg) {
+                const hasPngImage = /data:image\/png;base64,/i.test(svg);
+                log('photo sprite success', { packId, role: p.role, variant, hasPngImage, length: svg.length });
+                if (!hasPngImage) {
+                  log('photo sprite warning', {
+                    packId,
+                    role: p.role,
+                    variant,
+                    message: 'SVG returned without embedded PNG payload.',
+                  });
+                }
+              }
+            } catch (err) {
+              if (cancelled || upstreamAbortController.signal.aborted || err?.message?.includes('cancelled')) {
+                cancelled = true;
+                break;
+              }
+              log('photo sprite generation failed', err?.message || err);
+              emitProgress(progressChannel, 'piece-error', { packId, role: p.role, variant, error: err?.message || err });
+              throw new Error(`Photoreal generation failed for ${p.role}/${variant}: ${err?.message || err}`);
+            }
+            if (!svg) {
+              log('photo sprite generation returned empty', { role: p.role, variant });
+              emitProgress(progressChannel, 'piece-error', { packId, role: p.role, variant, error: `Photoreal generation failed for ${p.role}/${variant}` });
+              if (gameId) {
+                updateJobPieceState(gameId, normalizedRole, variant, { status: 'error' });
+              }
+              throw new Error(`Photoreal generation failed for ${p.role}/${variant}`);
+            }
+          } else {
+            if (promptForModel) {
+              log('vector ai request', {
+                packId,
+                role: p.role,
+                variant,
+                promptPreview: promptForModel.slice(0, 160),
+                size: pieceSize,
+                providerPreference,
+                openai: willUseOpenAI,
+              });
+              if (willUseOpenAI) {
+                svg = await generateAISVG({
+                  role: p.role,
+                  variant,
+                  prompt: promptForModel,
+                  size: pieceSize,
+                  theme,
+                  signal: upstreamAbortController.signal,
+                  providerPreference,
+                });
+              } else {
+                log('vector ai skipped openai (provider resolved to local)', { packId, role: p.role, variant, providerPreference });
+                svg = null;
+              }
+              if (cancelled) {
+                log('vector svg result discarded due to cancellation', { packId, role: p.role, variant });
+                break;
+              }
+              if (svg) {
+                log('vector ai success', { packId, role: p.role, variant, length: svg.length });
+              }
+            }
+            if (upstreamAbortController.signal.aborted) {
+              cancelled = true;
+            }
+            if (cancelled) break;
+
+            if (!svg) {
+              const fallbackSvg = (() => {
+                if (isCover) {
+                  try {
+                    const coverSeed = `${gameId || ''}-${packId}-${Date.now()}`;
+                    log('cover render fallback', { packId, gameId, seed: coverSeed, prompt: promptForModel });
+                    return renderCoverSVG({ size: pieceSize, theme, title: gameName || stylePrompt || 'Custom Game', seed: coverSeed });
+                  } catch (err) {
+                    log('cover fallback render failed', { packId, error: err?.message || err, stack: err?.stack ? 'yes' : 'no' });
+                    return null;
+                  }
+                }
+                try {
+                  const fillColor = variant === 'p1' ? theme?.p1Color || '#1e90ff' : variant === 'p2' ? theme?.p2Color || '#ff3b30' : color;
+                  return renderChessPieceSVG({ role: normalizedRole, size: pieceSize, fill: fillColor, accent: theme?.accent || '#ffd60a', outline: theme?.outline || '#202020' });
+                } catch (err) {
+                  log('vector fallback render failed', { packId, role: p.role, variant, error: err?.message || err });
+                  return null;
+                }
+              })();
+              if (fallbackSvg) {
+                svg = fallbackSvg;
+                finalStatus = 'fallback';
+                log('vector generation fallback used', { packId, role: p.role, variant });
+              } else {
+                finalStatus = 'missing';
+                log('vector generation returned empty', { packId, role: p.role, variant, reason: promptForAI ? 'AI returned empty' : 'No prompt provided' });
+              }
             } else {
-              log('vector ai skipped openai (provider resolved to local)', {
-                packId,
-                role: p.role,
-                variant,
-                providerPreference,
-              });
-              svg = null;
-            }
-            if (cancelled) {
-              log('vector svg result discarded due to cancellation', {
-                packId,
-                role: p.role,
-                variant,
-              });
-              break;
-            }
-            if (svg) {
-              log('vector ai success', {
-                packId,
-                role: p.role,
-                variant,
-                length: svg.length,
-              });
+              finalStatus = 'ready';
             }
           }
-          if (upstreamAbortController.signal.aborted) {
-            cancelled = true;
-          }
+
           if (cancelled) break;
 
           if (!svg) {
-            if (cancelled) break;
-            const fallbackSvg = (() => {
-              if (normalizedRole === 'cover') {
-                const coverSeed = `${gameId || ''}-${packId}-${Date.now()}`;
-                log('cover render fallback', {
-                  packId,
-                  gameId,
-                  seed: coverSeed,
-                  prompt: promptForModel,
-                });
-                return renderCoverSVG({
-                  size: pieceSize,
-                  theme,
-                  title: gameName || stylePrompt || 'Custom Game',
-                  seed: coverSeed,
-                });
-              }
-              try {
-                const fillColor =
-                  variant === 'p1'
-                    ? theme?.p1Color || '#1e90ff'
-                    : variant === 'p2'
-                    ? theme?.p2Color || '#ff3b30'
-                    : color;
-                return renderChessPieceSVG({
-                  role: normalizedRole,
-                  size: pieceSize,
-                  fill: fillColor,
-                  accent: theme?.accent || '#ffd60a',
-                  outline: theme?.outline || '#202020',
-                });
-              } catch (err) {
-                log('vector fallback render failed', {
-                  packId,
-                  role: p.role,
-                  variant,
-                  error: err?.message || err,
-                });
-                return null;
-              }
-            })();
-            if (fallbackSvg) {
-              svg = fallbackSvg;
-              finalStatus = 'fallback';
-              log('vector generation fallback used', {
-                packId,
-                role: p.role,
-                variant,
-              });
-            } else {
-              finalStatus = 'missing';
-              log('vector generation returned empty', {
-                packId,
-                role: p.role,
-                variant,
-                reason: promptForAI ? 'AI returned empty' : 'No prompt provided',
-              });
-            }
-          } else {
-            finalStatus = 'ready';
-          }
-        }
-
-        if (cancelled) break;
-
-        if (!svg) {
-          if (wantsPhotoreal) {
-            emitProgress(progressChannel, 'piece-error', {
-              packId,
-              role: p.role,
-              variant,
-              error: `Photoreal generation failed for ${p.role}/${variant}`,
-            });
+            emitProgress(progressChannel, 'piece-error', { packId, role: p.role, variant, error: `generation failed for ${p.role}/${variant}` });
             if (gameId) {
               updateJobPieceState(gameId, normalizedRole, variant, { status: 'error' });
             }
-            throw new Error(`Photoreal generation failed for ${p.role}/${variant}`);
+            remainingPieces -= 1;
+            const continueAfterMissing = await awaitAdvanceIfNeeded();
+            if (!continueAfterMissing) {
+              break;
+            }
+            continue;
           }
 
-        emitProgress(progressChannel, 'piece', {
-          packId,
-          role: p.role,
-          variant,
-          status: 'missing',
-          vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
-          vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
-          openai: renderStyle === 'vector' ? willUseOpenAI : null,
-          openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
-          openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
-        });
-        if (gameId) {
-          updateJobPieceState(gameId, normalizedRole, variant, { status: 'missing' });
-        }
-        remainingPieces -= 1;
-        const continueAfterMissing = await awaitAdvanceIfNeeded();
-        if (!continueAfterMissing) {
-          break;
-        }
-        continue;
-      }
-        if (cancelled) {
-          log('skip writing piece due to cancellation', { packId, role: p.role, variant });
-          break;
-        }
-        await fs.writeFile(filePath, svg, 'utf8');
-        log('   wrote asset', { packId, role: p.role, variant, filePath });
-        await mirrorWrite(mirrorDir, path.join(packId, 'pieces', p.role, filename), svg);
+          await fs.writeFile(filePath, svg, 'utf8');
+          log('   wrote asset', { packId, boardId, role: p.role, variant, filePath });
 
-        files[p.role] ||= {};
-        files[p.role][variant] = `/skins/${packId}/pieces/${p.role}/${filename}`;
+          const rolePath = isCover ? 'cover' : `pieces/${p.role}`;
+          const urlPath = `/skins/${packId}/${boardId}/${rolePath}/${filename}`;
+          
+          if (isCover) {
+            // Cover is board-scoped - use board id as the key (main variant collapses to boardId)
+            const coverKey = variant === 'main' ? boardId : `${boardId}-${variant}`;
+            files.cover ||= {};
+            files.cover[coverKey] = urlPath;
+            boardAssets[boardId] ||= {};
+            boardAssets[boardId].cover = urlPath;
+          } else {
+            // Tokens are stored with board prefix for board-scoped rendering
+            files[p.role] ||= {};
+            files[p.role][`${boardId}-${variant}`] = urlPath;
+            boardAssets[boardId] ||= {};
+            boardAssets[boardId].tokens ||= {};
+            boardAssets[boardId].tokens[variant] = urlPath;
+            // No longer populate pieces - tokens is sufficient
+          }
 
-        emitProgress(progressChannel, 'piece', {
-          packId,
-          role: p.role,
-          variant,
-          url: files[p.role][variant],
-          status: finalStatus,
-          prompt: promptForModel,
-          vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
-          vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
-          openai: renderStyle === 'vector' ? willUseOpenAI : null,
-          openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
-          openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
-        });
-
-        if (gameId) {
-          updateJobPieceState(gameId, normalizedRole, variant, {
+          emitProgress(progressChannel, 'piece', {
+            packId,
+            role: p.role,
+            variant,
+            url: urlPath,
             status: finalStatus,
-            url: files[p.role][variant],
             prompt: promptForModel,
+            vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
+            vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+            openai: renderStyle === 'vector' ? willUseOpenAI : null,
+            openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+            openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
           });
-        }
 
-        await writeManifestPartial(false);
-        remainingPieces -= 1;
-        const shouldContinue = await awaitAdvanceIfNeeded();
-        if (!shouldContinue) {
-          break;
+          if (gameId) {
+            updateJobPieceState(gameId, normalizedRole, variant, {
+              status: finalStatus,
+              url: urlPath,
+              prompt: promptForModel,
+            });
+          }
+
+          if (gameId) {
+            updateJobPieceState(gameId, normalizedRole, variant, {
+              status: finalStatus,
+              url: urlPath,
+              prompt: promptForModel,
+            });
+          }
+
+          await writeManifestPartial(false);
+          remainingPieces -= 1;
+          const shouldContinue = await awaitAdvanceIfNeeded();
+          if (!shouldContinue) {
+            break;
+          }
         }
       }
+    }
+    // end board asset generation
     }
 
     if (typeof req.off === 'function') {
@@ -1174,11 +1199,7 @@ router.post('/', async (req, res) => {
         markJobStateCancelled(gameId);
       }
       clearPendingJob(gameId, upstreamAbortController);
-      try {
-        await writeManifestPartial(false);
-      } catch (manifestErr) {
-        log('failed to persist cancelled manifest', { packId, error: manifestErr?.message || manifestErr });
-      }
+      await writeManifestPartial(false);
       log('pack generation cancelled (partial assets preserved)', { packId, baseDir });
       res.status(499).json({
         ok: false,
@@ -1186,21 +1207,17 @@ router.post('/', async (req, res) => {
         error: 'cancelled',
         packId,
         baseUrl: `/skins/${packId}/`,
-        manifestUrl: `/skins/${packId}/manifest.json`,
         files,
         renderStyle,
       });
       return;
     }
 
-    const finalManifest = buildManifest(true);
-    await writeManifestSnapshot(baseDir, mirrorDir, packId, finalManifest);
-    log('pack ready', { packId, pieces: Object.keys(files).length, manifest: `/skins/${packId}/manifest.json` });
+    log('pack ready', { packId, pieces: Object.keys(files).length });
     const stateSnapshot = gameId ? jobStates.get(String(gameId)) : null;
     const promptSnapshot = collectJobPrompts(stateSnapshot);
     emitProgress(progressChannel, 'complete', {
       packId,
-      manifestUrl: `/skins/${packId}/manifest.json`,
       files,
       renderStyle,
       vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
@@ -1216,14 +1233,18 @@ router.post('/', async (req, res) => {
     }
     if (gameId) {
       markJobState(gameId, { active: false });
+      // Auto-cleanup old packs: keep 2 most recent per game
+      cleanupOldPacksForGame(gameId, packsDir, 2).catch(err => 
+        log('cleanup after generation failed', { gameId, err: err?.message || err })
+      );
     }
 
     res.status(201).json({
       ok: true,
       packId,
       baseUrl: `/skins/${packId}/`,
-      files,
-      manifestUrl: `/skins/${packId}/manifest.json`,
+      files: sortFilesMap(files),
+      boardAssets: sortBoardAssets(boardAssets),
       renderStyle,
     });
   } catch (err) {
@@ -1249,14 +1270,12 @@ router.post('/', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
   const packsDir = req.app.get('packsDir');
-  const mirrorDir = req.app.get('packsMirrorDir');
   const packId = req.params.id;
   if (!packId) {
     return res.status(400).json({ ok: false, error: 'packId required' });
   }
 
   const packPath = path.join(packsDir, packId);
-  const mirrorPath = mirrorDir ? path.join(mirrorDir, packId) : null;
 
   try {
     const stat = await fs.stat(packPath).catch(() => null);
@@ -1265,13 +1284,58 @@ router.delete('/:id', async (req, res) => {
     }
 
     await fs.rm(packPath, { recursive: true, force: true });
-    if (mirrorPath) {
-      await fs.rm(mirrorPath, { recursive: true, force: true }).catch(() => {});
-    }
     log('deleted pack directory', { packId });
     res.json({ ok: true, packId, deleted: true });
   } catch (err) {
     log('delete pack failed', { packId, error: err?.message || err });
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+/**
+ * DELETE /api/skins/packs/for-game/:gameId
+ * Delete all packs for a specific game (called when game is deleted).
+ */
+router.delete('/for-game/:gameId', async (req, res) => {
+  const packsDir = req.app.get('packsDir');
+  const { gameId } = req.params;
+  
+  if (!gameId) {
+    return res.status(400).json({ ok: false, error: 'gameId required' });
+  }
+
+  try {
+    const items = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
+    const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
+    
+    // All packs are game-agnostic by name (pack_<timestamp>_<nanoId>)
+    // So we delete ALL packs when game is deleted (they're temporary artifacts).
+    // If you want gameId-specific cleanup, extract gameId from metadata or track it separately.
+    const deleted = [];
+    const failed = [];
+    
+    for (const packName of allPacks) {
+      const packPath = path.join(packsDir, packName);
+      try {
+        await fs.rm(packPath, { recursive: true, force: true });
+        deleted.push(packName);
+        log('deleted pack for game cleanup', { gameId, packId: packName });
+      } catch (err) {
+        failed.push(packName);
+        log('failed to delete pack for game', { gameId, packId: packName, error: err?.message || err });
+      }
+    }
+
+    res.json({
+      ok: true,
+      gameId,
+      deleted,
+      failed,
+      totalDeleted: deleted.length,
+      totalFailed: failed.length,
+    });
+  } catch (err) {
+    log('cleanup packs for game failed', { gameId, error: err?.message || err });
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
