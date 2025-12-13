@@ -14,6 +14,7 @@ import {
   closeChannel,
   attachAbortController,
 } from '../services/progressHub.js';
+import { normalizeIdentifier, formatIdentifier } from '../types/assetIdentifier.js';
 
 const router = Router();
 const log = (...msg) => console.log(new Date().toISOString(), '[packs]', ...msg);
@@ -660,7 +661,6 @@ router.post('/', async (req, res) => {
     await fs.mkdir(baseDir, { recursive: true });
     await fs.mkdir(baseDir, { recursive: true });
 
-    const files = {};
     const boardAssets = {};
     // legacy write helpers to keep old paths alive until frontend fully per-board
     const boardsMap = Array.isArray(boards)
@@ -803,8 +803,6 @@ router.post('/', async (req, res) => {
           await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
           await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
           await fs.writeFile(path.join(boardPath, 'preview.svg'), backgroundSvg, 'utf8');
-          files.board ||= {};
-          files.board[boardId] = boardPreviewRel;
           boardAssets[boardId] = {
             ...(boardAssets[boardId] || {}),
             boardPreview: boardPreviewRel,
@@ -930,15 +928,20 @@ router.post('/', async (req, res) => {
 
               const rolePath = isCover ? 'cover' : `pieces/${p.role}`;
               const urlPath = `/skins/${packId}/${boardId}/${rolePath}/${filename}`;
-              files[p.role] ||= {};
-              files[p.role][`${boardId}-${variant}`] = urlPath;
+              
+              // Phase 2: Use formatIdentifier for consistent reused asset keys
+              const assetKey = formatIdentifier({
+                role: normalizedRole,
+                boardId,
+                variant: variant === 'main' ? null : variant,
+              });
+              
               boardAssets[boardId] ||= {};
               if (isCover) {
                 boardAssets[boardId].cover = urlPath;
               } else {
                 boardAssets[boardId].tokens ||= {};
                 boardAssets[boardId].tokens[variant] = urlPath;
-                // No longer populate pieces - tokens is sufficient
               }
 
               emitProgress(progressChannel, 'piece', {
@@ -1126,21 +1129,19 @@ router.post('/', async (req, res) => {
           const rolePath = isCover ? 'cover' : `pieces/${p.role}`;
           const urlPath = `/skins/${packId}/${boardId}/${rolePath}/${filename}`;
           
+          // Phase 2: Use formatIdentifier for consistent key generation
+          const assetKey = formatIdentifier({
+            role: normalizedRole,
+            boardId,
+            variant: variant === 'main' ? null : variant,
+          });
+          
+          boardAssets[boardId] ||= {};
           if (isCover) {
-            // Cover is board-scoped - use board id as the key (main variant collapses to boardId)
-            const coverKey = variant === 'main' ? boardId : `${boardId}-${variant}`;
-            files.cover ||= {};
-            files.cover[coverKey] = urlPath;
-            boardAssets[boardId] ||= {};
             boardAssets[boardId].cover = urlPath;
           } else {
-            // Tokens are stored with board prefix for board-scoped rendering
-            files[p.role] ||= {};
-            files[p.role][`${boardId}-${variant}`] = urlPath;
-            boardAssets[boardId] ||= {};
             boardAssets[boardId].tokens ||= {};
             boardAssets[boardId].tokens[variant] = urlPath;
-            // No longer populate pieces - tokens is sufficient
           }
 
           emitProgress(progressChannel, 'piece', {
@@ -1207,18 +1208,26 @@ router.post('/', async (req, res) => {
         error: 'cancelled',
         packId,
         baseUrl: `/skins/${packId}/`,
-        files,
+        manifestUrl: `/skins/${packId}/manifest.json`,
+        boardAssets: sortBoardAssets(boardAssets),
         renderStyle,
       });
       return;
     }
 
-    log('pack ready', { packId, pieces: Object.keys(files).length });
+    // Count total pieces across all boards
+    const totalPieces = Object.values(boardAssets).reduce((count, board) => {
+      return count + (board.tokens ? Object.keys(board.tokens).length : 0);
+    }, 0);
+    
+    log('pack ready', { packId, pieces: totalPieces, boards: Object.keys(boardAssets).length });
     const stateSnapshot = gameId ? jobStates.get(String(gameId)) : null;
     const promptSnapshot = collectJobPrompts(stateSnapshot);
     emitProgress(progressChannel, 'complete', {
       packId,
-      files,
+      baseUrl: `/skins/${packId}/`,
+      manifestUrl: `/skins/${packId}/manifest.json`,
+      boardAssets: sortBoardAssets(boardAssets),
       renderStyle,
       vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
       vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
@@ -1243,7 +1252,7 @@ router.post('/', async (req, res) => {
       ok: true,
       packId,
       baseUrl: `/skins/${packId}/`,
-      files: sortFilesMap(files),
+      manifestUrl: `/skins/${packId}/manifest.json`,
       boardAssets: sortBoardAssets(boardAssets),
       renderStyle,
     });
