@@ -7,7 +7,7 @@ import Joi from 'joi';
 import { generateAISVG, isOpenAiSvgAvailable, getOpenAiSvgEnv } from '../services/aiSvgGenerator.js';
 import { generatePhotoSpriteSVG } from '../services/photoSpriteGenerator.js';
 import { sanitizePrompt } from '../lib/sanitizePrompt.js';
-import { renderChessPieceSVG, renderCoverSVG } from '../tri/svgTemplates.js';
+import { renderChessPieceSVG, renderCoverSVG, renderTokenSVG, renderBackgroundSVG, renderTileSVG } from '../tri/svgTemplates.js';
 import {
   registerClient,
   emitProgress,
@@ -788,37 +788,110 @@ router.post('/', async (req, res) => {
         const writeBoardAsset = async (boardId, name) => {
           const boardPath = path.join(baseDir, boardId, 'board');
           await fs.mkdir(boardPath, { recursive: true });
-          const light = theme?.p1Color || '#e8e8e8';
-        const dark = theme?.p2Color || '#d8d8d8';
-        const accent = theme?.accent || '#ffd60a';
-        const outline = theme?.outline || '#202020';
-        const backgroundSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${light}" stop-opacity="0.85"/><stop offset="100%" stop-color="${dark}" stop-opacity="0.9"/></linearGradient></defs><rect width="1024" height="1024" fill="url(#g)"/><circle cx="180" cy="180" r="120" fill="${accent}" opacity="0.12"/><circle cx="860" cy="220" r="140" fill="${outline}" opacity="0.08"/><rect x="260" y="520" width="520" height="320" rx="24" fill="${outline}" opacity="0.05"/></svg>`;
-        const tileLightSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${light}" stroke="${outline}" stroke-width="2" opacity="0.5"/></svg>`;
-        const tileDarkSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="10" fill="${dark}" stroke="${outline}" stroke-width="2" opacity="0.55"/><circle cx="28" cy="28" r="12" fill="${accent}" opacity="0.2"/></svg>`;
-        const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
-        const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
-        const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
-        const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
-        await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
-          await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
-          await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
-          await fs.writeFile(path.join(boardPath, 'preview.svg'), backgroundSvg, 'utf8');
-          boardAssets[boardId] = {
-            ...(boardAssets[boardId] || {}),
-            boardPreview: boardPreviewRel,
-            background: bgRel,
-            tileLight: lightRel,
-            tileDark: darkRel,
-          };
-          boardsMap[boardId] = {
-            ...(boardsMap[boardId] || {}),
-            id: boardId,
-            name: name || boardsMap[boardId]?.name || boardId,
-            background: bgRel,
-            tileLight: lightRel,
-            tileDark: darkRel,
-            preview: boardPreviewRel,
-          };
+          
+          // CRITICAL: Always copy existing board assets when resumeSourceDir exists
+          // This preserves board-1 assets when adding board-2
+          const shouldCopyExisting = resumeSourceDir;
+          const existingBoardPath = shouldCopyExisting ? path.join(resumeSourceDir, boardId, 'board') : null;
+          let copiedFromExisting = false;
+          
+          if (existingBoardPath) {
+            try {
+              const existingBgPath = path.join(existingBoardPath, 'background.svg');
+              const existingLightPath = path.join(existingBoardPath, 'tileLight.svg');
+              const existingDarkPath = path.join(existingBoardPath, 'tileDark.svg');
+              const existingPreviewPath = path.join(existingBoardPath, 'preview.svg');
+              
+              // Check if all required files exist
+              const [bgExists, lightExists, darkExists, previewExists] = await Promise.all([
+                pathExists(existingBgPath),
+                pathExists(existingLightPath),
+                pathExists(existingDarkPath),
+                pathExists(existingPreviewPath),
+              ]);
+              
+              if (bgExists && lightExists && darkExists && previewExists) {
+                // Copy all board assets from existing pack
+                await Promise.all([
+                  fs.copyFile(existingBgPath, path.join(boardPath, 'background.svg')),
+                  fs.copyFile(existingLightPath, path.join(boardPath, 'tileLight.svg')),
+                  fs.copyFile(existingDarkPath, path.join(boardPath, 'tileDark.svg')),
+                  fs.copyFile(existingPreviewPath, path.join(boardPath, 'preview.svg')),
+                ]);
+                
+                const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
+                const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
+                const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
+                const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+                
+                boardAssets[boardId] = {
+                  ...(boardAssets[boardId] || {}),
+                  boardPreview: boardPreviewRel,
+                  background: bgRel,
+                  tileLight: lightRel,
+                  tileDark: darkRel,
+                };
+                boardsMap[boardId] = {
+                  ...(boardsMap[boardId] || {}),
+                  id: boardId,
+                  name: name || boardsMap[boardId]?.name || boardId,
+                  background: bgRel,
+                  tileLight: lightRel,
+                  tileDark: darkRel,
+                  preview: boardPreviewRel,
+                };
+                
+                copiedFromExisting = true;
+                log('copied existing board assets', { packId, boardId, from: resumePackIdClean });
+              }
+            } catch (err) {
+              log('failed to copy existing board assets, will regenerate', { packId, boardId, error: err?.message });
+            }
+          }
+          
+          // Only generate if we didn't copy from existing
+          if (!copiedFromExisting) {
+            const light = theme?.p1Color || '#e8e8e8';
+            const dark = theme?.p2Color || '#d8d8d8';
+            const accent = theme?.accent || '#ffd60a';
+            const outline = theme?.outline || '#202020';
+            
+            // Generate with seeds for variation
+            const bgSeed = `${gameId || ''}-${packId}-${boardId}-bg-${Date.now()}`;
+            const lightSeed = `${gameId || ''}-${packId}-${boardId}-light-${Date.now()}`;
+            const darkSeed = `${gameId || ''}-${packId}-${boardId}-dark-${Date.now()}`;
+            
+            const backgroundSvg = renderBackgroundSVG({ light, dark, accent, outline, seed: bgSeed });
+            const tileLightSvg = renderTileSVG({ fill: light, accent, outline, isLight: true, seed: lightSeed });
+            const tileDarkSvg = renderTileSVG({ fill: dark, accent, outline, isLight: false, seed: darkSeed });
+            
+            const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
+            const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
+            const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
+            const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+            await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
+            await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
+            await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
+            await fs.writeFile(path.join(boardPath, 'preview.svg'), backgroundSvg, 'utf8');
+            boardAssets[boardId] = {
+              ...(boardAssets[boardId] || {}),
+              boardPreview: boardPreviewRel,
+              background: bgRel,
+              tileLight: lightRel,
+              tileDark: darkRel,
+            };
+            boardsMap[boardId] = {
+              ...(boardsMap[boardId] || {}),
+              id: boardId,
+              name: name || boardsMap[boardId]?.name || boardId,
+              background: bgRel,
+              tileLight: lightRel,
+              tileDark: darkRel,
+              preview: boardPreviewRel,
+            };
+            
+            log('generated new board assets', { packId, boardId });
+          }
       };
 
       for (const boardId of boardIds) {
@@ -1059,8 +1132,36 @@ router.post('/', async (req, res) => {
                   providerPreference,
                 });
               } else {
-                log('vector ai skipped openai (provider resolved to local)', { packId, role: p.role, variant, providerPreference });
-                svg = null;
+                // Local provider: use template SVGs with variation (don't log as skipped, this IS the local generation)
+                log('vector local generation using templates', { packId, role: p.role, variant, providerPreference });
+                // Generate immediately using template with seed for variation
+                const pieceSeed = `${gameId || ''}-${packId}-${normalizedRole}-${variant}-${Date.now()}`;
+                if (isCover) {
+                  const coverSeed = `${gameId || ''}-${packId}-${Date.now()}`;
+                  svg = renderCoverSVG({ size: pieceSize, theme, title: gameName || stylePrompt || 'Custom Game', seed: coverSeed });
+                } else {
+                  const fillColor = variant === 'p1' ? theme?.p1Color || '#1e90ff' : variant === 'p2' ? theme?.p2Color || '#ff3b30' : color;
+                  // Use token SVG for token roles, chess piece SVG for specific roles
+                  if (normalizedRole === 'token') {
+                    svg = renderTokenSVG({ 
+                      size: pieceSize, 
+                      fill: fillColor, 
+                      accent: theme?.accent || '#ffd60a', 
+                      outline: theme?.outline || '#202020',
+                      seed: pieceSeed
+                    });
+                  } else {
+                    svg = renderChessPieceSVG({ 
+                      role: normalizedRole, 
+                      size: pieceSize, 
+                      fill: fillColor, 
+                      accent: theme?.accent || '#ffd60a', 
+                      outline: theme?.outline || '#202020',
+                      seed: pieceSeed
+                    });
+                  }
+                }
+                log('vector local template generated', { packId, role: p.role, variant, length: svg?.length || 0 });
               }
               if (cancelled) {
                 log('vector svg result discarded due to cancellation', { packId, role: p.role, variant });
@@ -1089,7 +1190,26 @@ router.post('/', async (req, res) => {
                 }
                 try {
                   const fillColor = variant === 'p1' ? theme?.p1Color || '#1e90ff' : variant === 'p2' ? theme?.p2Color || '#ff3b30' : color;
-                  return renderChessPieceSVG({ role: normalizedRole, size: pieceSize, fill: fillColor, accent: theme?.accent || '#ffd60a', outline: theme?.outline || '#202020' });
+                  const pieceSeed = `${gameId || ''}-${packId}-${normalizedRole}-${variant}-${Date.now()}`;
+                  // Use token SVG for token roles, chess piece SVG for specific roles
+                  if (normalizedRole === 'token') {
+                    return renderTokenSVG({ 
+                      size: pieceSize, 
+                      fill: fillColor, 
+                      accent: theme?.accent || '#ffd60a', 
+                      outline: theme?.outline || '#202020',
+                      seed: pieceSeed
+                    });
+                  } else {
+                    return renderChessPieceSVG({ 
+                      role: normalizedRole, 
+                      size: pieceSize, 
+                      fill: fillColor, 
+                      accent: theme?.accent || '#ffd60a', 
+                      outline: theme?.outline || '#202020',
+                      seed: pieceSeed
+                    });
+                  }
                 } catch (err) {
                   log('vector fallback render failed', { packId, role: p.role, variant, error: err?.message || err });
                   return null;

@@ -28,26 +28,109 @@ export function renderTokenSVG({
   size = 512,
   fill = DEFAULT_FILL,
   accent = DEFAULT_ACCENT,
-  outline = DEFAULT_OUTLINE
+  outline = DEFAULT_OUTLINE,
+  seed,
 } = {}) {
   const s = Number(size) || 512;
   const r = s * 0.44;
   const cx = s / 2;
   const cy = s / 2;
 
+  // Add variation based on seed
+  let accentCount = 1;
+  let accentPositions = [{ x: cx - r * 0.35, y: cy - r * 0.35, size: r * 0.10 }];
+  let shapeVariation = 'circle'; // circle, hexagon, star
+  let gradientRotation = 0;
+  
+  if (seed) {
+    const rand = createSeededRandom(seed);
+    
+    // Vary number and position of accent dots (1-3)
+    accentCount = 1 + Math.floor(rand() * 3);
+    accentPositions = [];
+    for (let i = 0; i < accentCount; i++) {
+      const angle = (i / accentCount) * Math.PI * 2 + rand() * Math.PI * 0.5;
+      const distance = r * (0.3 + rand() * 0.15);
+      accentPositions.push({
+        x: cx + Math.cos(angle) * distance,
+        y: cy + Math.sin(angle) * distance,
+        size: r * (0.08 + rand() * 0.04),
+      });
+    }
+    
+    // Vary gradient rotation
+    gradientRotation = Math.floor(rand() * 360);
+    
+    // Vary outer shape
+    const shapeRoll = rand();
+    if (shapeRoll < 0.6) {
+      shapeVariation = 'circle';
+    } else if (shapeRoll < 0.85) {
+      shapeVariation = 'hexagon';
+    } else {
+      shapeVariation = 'star';
+    }
+  }
+
+  const accentDots = accentPositions
+    .map(
+      (pos) =>
+        `<circle cx="${pos.x.toFixed(2)}" cy="${pos.y.toFixed(2)}" r="${pos.size.toFixed(2)}" fill="${accent}" opacity="0.9"/>`,
+    )
+    .join('\n  ');
+
+  let mainShape = '';
+  let outlineShape = '';
+  
+  if (shapeVariation === 'hexagon') {
+    const hexPoints = [];
+    for (let i = 0; i < 6; i++) {
+      const angle = (i / 6) * Math.PI * 2 - Math.PI / 2;
+      hexPoints.push(`${(cx + Math.cos(angle) * r).toFixed(2)},${(cy + Math.sin(angle) * r).toFixed(2)}`);
+    }
+    const hexOutlinePoints = [];
+    for (let i = 0; i < 6; i++) {
+      const angle = (i / 6) * Math.PI * 2 - Math.PI / 2;
+      hexOutlinePoints.push(`${(cx + Math.cos(angle) * (r + 6)).toFixed(2)},${(cy + Math.sin(angle) * (r + 6)).toFixed(2)}`);
+    }
+    outlineShape = `<polygon points="${hexOutlinePoints.join(' ')}" fill="${outline}" opacity="0.9"/>`;
+    mainShape = `<polygon points="${hexPoints.join(' ')}" fill="${fill}"/>
+  <polygon points="${hexPoints.join(' ')}" fill="url(#g1)" />`;
+  } else if (shapeVariation === 'star') {
+    const starPoints = [];
+    for (let i = 0; i < 10; i++) {
+      const angle = (i / 10) * Math.PI * 2 - Math.PI / 2;
+      const radius = i % 2 === 0 ? r : r * 0.5;
+      starPoints.push(`${(cx + Math.cos(angle) * radius).toFixed(2)},${(cy + Math.sin(angle) * radius).toFixed(2)}`);
+    }
+    const starOutlinePoints = [];
+    for (let i = 0; i < 10; i++) {
+      const angle = (i / 10) * Math.PI * 2 - Math.PI / 2;
+      const radius = i % 2 === 0 ? r + 6 : r * 0.5 + 6;
+      starOutlinePoints.push(`${(cx + Math.cos(angle) * radius).toFixed(2)},${(cy + Math.sin(angle) * radius).toFixed(2)}`);
+    }
+    outlineShape = `<polygon points="${starOutlinePoints.join(' ')}" fill="${outline}" opacity="0.9"/>`;
+    mainShape = `<polygon points="${starPoints.join(' ')}" fill="${fill}"/>
+  <polygon points="${starPoints.join(' ')}" fill="url(#g1)" />`;
+  } else {
+    // Default circle
+    outlineShape = `<circle cx="${cx}" cy="${cy}" r="${r + 6}" fill="${outline}" opacity="0.9"/>`;
+    mainShape = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill}"/>
+  <circle cx="${cx}" cy="${cy}" r="${r}" fill="url(#g1)" />`;
+  }
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg width="${s}" height="${s}" viewBox="0 0 ${s} ${s}" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <radialGradient id="g1" cx="50%" cy="45%" r="65%">
+    <radialGradient id="g1" cx="50%" cy="45%" r="65%" gradientTransform="rotate(${gradientRotation} 0.5 0.5)">
       <stop offset="0%" stop-color="#ffffff" stop-opacity="0.25"/>
       <stop offset="60%" stop-color="#ffffff" stop-opacity="0.06"/>
       <stop offset="100%" stop-color="#000000" stop-opacity="0.25"/>
     </radialGradient>
   </defs>
-  <circle cx="${cx}" cy="${cy}" r="${r + 6}" fill="${outline}" opacity="0.9"/>
-  <circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill}"/>
-  <circle cx="${cx}" cy="${cy}" r="${r}" fill="url(#g1)" />
-  <circle cx="${cx - r * 0.35}" cy="${cy - r * 0.35}" r="${r * 0.10}" fill="${accent}" opacity="0.9"/>
+  ${outlineShape}
+  ${mainShape}
+  ${accentDots}
 </svg>`;
 }
 
@@ -126,16 +209,97 @@ export function renderChessPieceSVG({
   fill = DEFAULT_FILL,
   accent = DEFAULT_ACCENT,
   outline = DEFAULT_OUTLINE,
+  seed,
 } = {}) {
   const normalized = (role || '').toLowerCase();
+  
+  // Add color variation based on seed
+  let variedFill = fill;
+  let variedAccent = accent;
+  let variedOutline = outline;
+  
+  if (seed) {
+    const rand = createSeededRandom(seed);
+    
+    // Vary the fill color slightly (hue shift)
+    variedFill = varyColor(fill, rand() * 30 - 15, rand() * 0.15 - 0.075);
+    
+    // Vary the accent color
+    variedAccent = varyColor(accent, rand() * 40 - 20, rand() * 0.2 - 0.1);
+    
+    // Vary the outline slightly
+    variedOutline = varyColor(outline, rand() * 10 - 5, rand() * 0.1 - 0.05);
+  }
+  
   if (!chessRoles.has(normalized)) {
-    return renderTokenSVG({ size, fill, accent, outline });
+    return renderTokenSVG({ size, fill: variedFill, accent: variedAccent, outline: variedOutline });
   }
 
   const renderer = roleToSvg[normalized];
-  const content = renderer ? renderer(fill, accent, outline) : pawnSvg(fill, accent, outline);
-  return baseSvg(Number(size) || 512, outline, content);
+  const content = renderer ? renderer(variedFill, variedAccent, variedOutline) : pawnSvg(variedFill, variedAccent, variedOutline);
+  return baseSvg(Number(size) || 512, variedOutline, content);
 }
+
+function varyColor(hexColor, hueShift = 0, saturationShift = 0) {
+  // Parse hex color
+  const hex = hexColor.replace('#', '');
+  const r = parseInt(hex.substring(0, 2), 16) / 255;
+  const g = parseInt(hex.substring(2, 4), 16) / 255;
+  const b = parseInt(hex.substring(4, 6), 16) / 255;
+  
+  // Convert to HSL
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  let h = 0;
+  let s = 0;
+  const l = (max + min) / 2;
+  
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    
+    switch (max) {
+      case r: h = ((g - b) / d + (g < b ? 6 : 0)) / 6; break;
+      case g: h = ((b - r) / d + 2) / 6; break;
+      case b: h = ((r - g) / d + 4) / 6; break;
+    }
+  }
+  
+  // Apply shifts
+  h = (h + hueShift / 360) % 1;
+  if (h < 0) h += 1;
+  s = Math.max(0, Math.min(1, s + saturationShift));
+  
+  // Convert back to RGB
+  const hue2rgb = (p, q, t) => {
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1/6) return p + (q - p) * 6 * t;
+    if (t < 1/2) return q;
+    if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+    return p;
+  };
+  
+  let newR, newG, newB;
+  if (s === 0) {
+    newR = newG = newB = l;
+  } else {
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    newR = hue2rgb(p, q, h + 1/3);
+    newG = hue2rgb(p, q, h);
+    newB = hue2rgb(p, q, h - 1/3);
+  }
+  
+  // Convert to hex
+  const toHex = (n) => {
+    const hex = Math.round(n * 255).toString(16);
+    return hex.length === 1 ? '0' + hex : hex;
+  };
+  
+  return `#${toHex(newR)}${toHex(newG)}${toHex(newB)}`;
+}
+
 
 function escapeForSvg(value = '') {
   return String(value)
@@ -222,4 +386,154 @@ export function renderCoverSVG({
   <text x="50" y="${44 + rand() * 3}" text-anchor="middle" fill="#ffffff" font-size="14" font-weight="700" letter-spacing="0.8">${truncatedTitle}</text>
   <text x="50" y="${badgeY + badgeHeight - 1}" text-anchor="middle" fill="#ffffff" font-size="5" opacity="0.85">PlayFactory Generated Art</text>
 </svg>`;
+}
+
+export function renderBackgroundSVG({
+  light = '#e8e8e8',
+  dark = '#d8d8d8',
+  accent = '#ffd60a',
+  outline = '#202020',
+  seed,
+} = {}) {
+  let gradientAngle = { x1: 0, x2: 1, y1: 0, y2: 1 };
+  let shapes = [];
+  
+  if (seed) {
+    const rand = createSeededRandom(seed);
+    
+    // Vary gradient direction
+    const angleChoice = Math.floor(rand() * 4);
+    if (angleChoice === 0) {
+      gradientAngle = { x1: 0, x2: 1, y1: 0, y2: 1 }; // diagonal
+    } else if (angleChoice === 1) {
+      gradientAngle = { x1: 0, x2: 0, y1: 0, y2: 1 }; // vertical
+    } else if (angleChoice === 2) {
+      gradientAngle = { x1: 0, x2: 1, y1: 0, y2: 0 }; // horizontal
+    } else {
+      gradientAngle = { x1: 1, x2: 0, y1: 0, y2: 1 }; // reverse diagonal
+    }
+    
+    // Vary decorative shapes - 2-4 shapes at random positions
+    const shapeCount = 2 + Math.floor(rand() * 3);
+    for (let i = 0; i < shapeCount; i++) {
+      const x = 100 + rand() * 824;
+      const y = 100 + rand() * 824;
+      const size = 80 + rand() * 100;
+      const opacity = 0.08 + rand() * 0.08;
+      const fillChoice = rand();
+      const fill = fillChoice < 0.5 ? accent : outline;
+      
+      const shapeType = Math.floor(rand() * 3);
+      if (shapeType === 0) {
+        // Circle
+        shapes.push(`<circle cx="${x.toFixed(0)}" cy="${y.toFixed(0)}" r="${size.toFixed(0)}" fill="${fill}" opacity="${opacity.toFixed(2)}"/>`);
+      } else if (shapeType === 1) {
+        // Rectangle
+        shapes.push(`<rect x="${x.toFixed(0)}" y="${y.toFixed(0)}" width="${(size * 1.5).toFixed(0)}" height="${(size * 1.2).toFixed(0)}" rx="${(size * 0.15).toFixed(0)}" fill="${fill}" opacity="${opacity.toFixed(2)}"/>`);
+      } else {
+        // Ellipse
+        shapes.push(`<ellipse cx="${x.toFixed(0)}" cy="${y.toFixed(0)}" rx="${(size * 1.2).toFixed(0)}" ry="${size.toFixed(0)}" fill="${fill}" opacity="${opacity.toFixed(2)}"/>`);
+      }
+    }
+  } else {
+    // Default shapes
+    shapes = [
+      `<circle cx="180" cy="180" r="120" fill="${accent}" opacity="0.12"/>`,
+      `<circle cx="860" cy="220" r="140" fill="${outline}" opacity="0.08"/>`,
+      `<rect x="260" y="520" width="520" height="320" rx="24" fill="${outline}" opacity="0.05"/>`,
+    ];
+  }
+  
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="${gradientAngle.x1}" x2="${gradientAngle.x2}" y1="${gradientAngle.y1}" y2="${gradientAngle.y2}"><stop offset="0%" stop-color="${light}" stop-opacity="0.85"/><stop offset="100%" stop-color="${dark}" stop-opacity="0.9"/></linearGradient></defs><rect width="1024" height="1024" fill="url(#g)"/>${shapes.join('')}</svg>`;
+}
+
+export function renderTileSVG({
+  fill = '#e8e8e8',
+  accent = '#ffd60a',
+  outline = '#202020',
+  isLight = true,
+  seed,
+} = {}) {
+  let cornerRadius = 10;
+  let strokeWidth = 2;
+  let hasAccent = !isLight;
+  let accentShapes = [];
+  let baseOpacity = isLight ? 0.5 : 0.55;
+  let pattern = '';
+  
+  if (seed) {
+    const rand = createSeededRandom(seed);
+    
+    // Vary corner radius more dramatically
+    cornerRadius = 4 + Math.floor(rand() * 14);
+    
+    // Vary stroke width
+    strokeWidth = 1 + rand() * 2.5;
+    
+    // Vary base opacity
+    baseOpacity = (isLight ? 0.45 : 0.5) + rand() * 0.15;
+    
+    // Choose pattern type
+    const patternType = Math.floor(rand() * 5);
+    
+    if (patternType === 0) {
+      // Multiple accent dots
+      const dotCount = 2 + Math.floor(rand() * 4);
+      for (let i = 0; i < dotCount; i++) {
+        const x = 15 + rand() * 98;
+        const y = 15 + rand() * 98;
+        const size = 4 + rand() * 8;
+        const opacity = 0.12 + rand() * 0.18;
+        accentShapes.push(`<circle cx="${x.toFixed(0)}" cy="${y.toFixed(0)}" r="${size.toFixed(0)}" fill="${accent}" opacity="${opacity.toFixed(2)}"/>`);
+      }
+    } else if (patternType === 1) {
+      // Diagonal lines pattern
+      const lineCount = 3 + Math.floor(rand() * 3);
+      const spacing = 128 / lineCount;
+      const lineWidth = 1 + rand() * 2;
+      const lineOpacity = 0.08 + rand() * 0.12;
+      for (let i = 0; i < lineCount; i++) {
+        const offset = i * spacing;
+        pattern += `<line x1="${offset}" y1="0" x2="${offset + 128}" y2="128" stroke="${outline}" stroke-width="${lineWidth.toFixed(1)}" opacity="${lineOpacity.toFixed(2)}"/>`;
+      }
+    } else if (patternType === 2) {
+      // Corner accents
+      const cornerSize = 8 + rand() * 12;
+      const cornerOpacity = 0.1 + rand() * 0.15;
+      const corners = Math.floor(1 + rand() * 4);
+      if (corners >= 1) accentShapes.push(`<circle cx="${cornerSize}" cy="${cornerSize}" r="${cornerSize.toFixed(0)}" fill="${accent}" opacity="${cornerOpacity.toFixed(2)}"/>`);
+      if (corners >= 2) accentShapes.push(`<circle cx="${128 - cornerSize}" cy="${cornerSize}" r="${cornerSize.toFixed(0)}" fill="${accent}" opacity="${cornerOpacity.toFixed(2)}"/>`);
+      if (corners >= 3) accentShapes.push(`<circle cx="${cornerSize}" cy="${128 - cornerSize}" r="${cornerSize.toFixed(0)}" fill="${accent}" opacity="${cornerOpacity.toFixed(2)}"/>`);
+      if (corners >= 4) accentShapes.push(`<circle cx="${128 - cornerSize}" cy="${128 - cornerSize}" r="${cornerSize.toFixed(0)}" fill="${accent}" opacity="${cornerOpacity.toFixed(2)}"/>`);
+    } else if (patternType === 3) {
+      // Center shape
+      const shapeChoice = Math.floor(rand() * 3);
+      const size = 15 + rand() * 20;
+      const opacity = 0.12 + rand() * 0.18;
+      if (shapeChoice === 0) {
+        accentShapes.push(`<circle cx="64" cy="64" r="${size.toFixed(0)}" fill="${accent}" opacity="${opacity.toFixed(2)}"/>`);
+      } else if (shapeChoice === 1) {
+        accentShapes.push(`<rect x="${(64 - size).toFixed(0)}" y="${(64 - size).toFixed(0)}" width="${(size * 2).toFixed(0)}" height="${(size * 2).toFixed(0)}" rx="${(size * 0.3).toFixed(0)}" fill="${accent}" opacity="${opacity.toFixed(2)}"/>`);
+      } else {
+        accentShapes.push(`<polygon points="64,${64 - size} ${64 + size},${64 + size} ${64 - size},${64 + size}" fill="${accent}" opacity="${opacity.toFixed(2)}"/>`);
+      }
+    } else {
+      // Grid of small shapes
+      const gridSize = 2 + Math.floor(rand() * 2);
+      const cellSize = 128 / (gridSize + 1);
+      const shapeSize = 3 + rand() * 5;
+      const opacity = 0.08 + rand() * 0.12;
+      for (let row = 1; row <= gridSize; row++) {
+        for (let col = 1; col <= gridSize; col++) {
+          const x = col * cellSize;
+          const y = row * cellSize;
+          accentShapes.push(`<circle cx="${x.toFixed(0)}" cy="${y.toFixed(0)}" r="${shapeSize.toFixed(0)}" fill="${outline}" opacity="${opacity.toFixed(2)}"/>`);
+        }
+      }
+    }
+  } else if (!isLight) {
+    accentShapes.push(`<circle cx="28" cy="28" r="12" fill="${accent}" opacity="0.2"/>`);
+  }
+  
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="${cornerRadius}" fill="${fill}" stroke="${outline}" stroke-width="${strokeWidth.toFixed(1)}" opacity="${baseOpacity.toFixed(2)}"/>${pattern}${accentShapes.join('')}</svg>`;
 }
