@@ -280,6 +280,18 @@ const createSchema = Joi.object({
       grid: Joi.string().allow('', null),
     })
   ).default([]),
+  targetBoardIds: Joi.array().items(Joi.string()).default([]), // Which boards to regenerate
+  existingBoardAssets: Joi.object().pattern(
+    Joi.string(),
+    Joi.object({
+      boardPreview: Joi.string().allow('', null),
+      cover: Joi.string().allow('', null),
+      background: Joi.string().allow('', null),
+      tileLight: Joi.string().allow('', null),
+      tileDark: Joi.string().allow('', null),
+      tokens: Joi.object().pattern(Joi.string(), Joi.string()),
+    })
+  ).default({}), // Existing board assets with URLs to copy from
   size: Joi.number().integer().min(64).max(1024).default(512), // SVG viewBox (square)
   resumePackId: Joi.string().allow('', null),
   reuseExistingPack: Joi.boolean().default(false),
@@ -542,6 +554,8 @@ router.post('/', async (req, res) => {
     theme,
     pieces,
     boards,
+    targetBoardIds,
+    existingBoardAssets = {},
     size,
     resumePackId = null,
     reuseExistingPack = false,
@@ -661,7 +675,7 @@ router.post('/', async (req, res) => {
     await fs.mkdir(baseDir, { recursive: true });
     await fs.mkdir(baseDir, { recursive: true });
 
-    const boardAssets = {};
+    let boardAssets = {};  // Use 'let' to allow recreation if frozen
     // legacy write helpers to keep old paths alive until frontend fully per-board
     const boardsMap = Array.isArray(boards)
       ? boards.reduce((acc, b) => {
@@ -741,7 +755,147 @@ router.post('/', async (req, res) => {
 
     await writeManifestPartial(false);
 
-    const boardIds = Object.keys(boardsMap).length ? Object.keys(boardsMap) : ['board-1'];
+    let boardIds = Object.keys(boardsMap).length ? Object.keys(boardsMap) : ['board-1'];
+    
+    log('BEFORE FILTERING', {
+      packId,
+      gameId,
+      boardIds,
+      targetBoardIds,
+      existingBoardAssetsKeys: Object.keys(existingBoardAssets || {}),
+    });
+    
+    // Filter to only regenerate targeted boards if specified
+    if (Array.isArray(targetBoardIds) && targetBoardIds.length > 0) {
+      const targetSet = new Set(targetBoardIds.map(id => String(id).toLowerCase()));
+      boardIds = boardIds.filter(id => targetSet.has(String(id).toLowerCase()));
+      log('FILTERED TO TARGET BOARDS', {
+        packId,
+        gameId,
+        allBoards: Object.keys(boardsMap),
+        targetBoardIds,
+        filteredBoardIds: boardIds,
+      });
+      
+      // Copy non-targeted boards from their existing packs
+      if (existingBoardAssets && typeof existingBoardAssets === 'object') {
+        // Get ALL board IDs from existingBoardAssets, not just from boardsMap
+        const allExistingBoardIds = Object.keys(existingBoardAssets);
+        const nonTargetedBoards = allExistingBoardIds.filter(id => !targetSet.has(String(id).toLowerCase()));
+        
+        log('COPYING NON-TARGETED BOARDS', {
+          packId,
+          gameId,
+          allExistingBoardIds,
+          targetBoardIds,
+          nonTargetedBoards,
+          existingBoardAssetsKeys: Object.keys(existingBoardAssets),
+        });
+        
+        for (const boardId of nonTargetedBoards) {
+          const existing = existingBoardAssets[boardId];
+          if (!existing || typeof existing !== 'object') {
+            log('no existing assets for board', { packId, boardId });
+            continue;
+          }
+          
+          // Extract source pack ID from any existing URL
+          const sourcePackId = (() => {
+            const urls = [
+              existing.background,
+              existing.tileLight,
+              existing.tileDark,
+              existing.boardPreview,
+              existing.cover,
+            ].filter(Boolean);
+            for (const url of urls) {
+              const match = String(url).match(/\/skins\/(pack_[^\/]+)\//);
+              if (match) return match[1];
+            }
+            return null;
+          })();
+          
+          if (!sourcePackId) {
+            log('could not extract source pack for board', { packId, boardId, existing });
+            continue;
+          }
+          
+          const sourcePath = path.join(packsDir, sourcePackId, boardId);
+          const destPath = path.join(baseDir, boardId);
+          
+          try {
+            // Check if source exists
+            await fs.access(sourcePath);
+            
+            // Copy the entire board directory
+            await fs.cp(sourcePath, destPath, { recursive: true });
+            
+            // Update boardAssets with new URLs
+            // Build a fresh object to avoid any frozen object issues
+            const updatedBoardData = {};
+            if (existing.boardPreview) {
+              updatedBoardData.boardPreview = existing.boardPreview.replace(sourcePackId, packId);
+            }
+            if (existing.cover) {
+              updatedBoardData.cover = existing.cover.replace(sourcePackId, packId);
+            }
+            if (existing.background) {
+              updatedBoardData.background = existing.background.replace(sourcePackId, packId);
+            }
+            if (existing.tileLight) {
+              updatedBoardData.tileLight = existing.tileLight.replace(sourcePackId, packId);
+            }
+            if (existing.tileDark) {
+              updatedBoardData.tileDark = existing.tileDark.replace(sourcePackId, packId);
+            }
+            if (existing.tokens && typeof existing.tokens === 'object') {
+              updatedBoardData.tokens = {};
+              for (const [variant, url] of Object.entries(existing.tokens)) {
+                if (typeof url === 'string') {
+                  updatedBoardData.tokens[variant] = url.replace(sourcePackId, packId);
+                }
+              }
+            }
+            // Assign the complete object at once
+            // Defensive: if boardAssets is frozen, recreate it
+            try {
+              // Deep clone boardAssets before assignment to avoid frozen object issues
+              if (Object.isFrozen(boardAssets)) {
+                boardAssets = JSON.parse(JSON.stringify(boardAssets));
+              }
+              boardAssets[boardId] = updatedBoardData;
+            } catch (assignError) {
+              if (assignError.message && assignError.message.includes('read only')) {
+                log('boardAssets was frozen, recreating as mutable', {
+                  packId,
+                  boardId,
+                  existingKeys: Object.keys(boardAssets),
+                });
+                // Recreate as a fresh mutable object
+                boardAssets = JSON.parse(JSON.stringify({ ...boardAssets, [boardId]: updatedBoardData }));
+              } else {
+                throw assignError;
+              }
+            }
+            
+            log('copied board from existing pack', {
+              packId,
+              boardId,
+              sourcePackId,
+              copiedAssets: Object.keys(boardAssets[boardId] || {}),
+            });
+          } catch (err) {
+            log('failed to copy board from existing pack', {
+              packId,
+              boardId,
+              sourcePackId,
+              error: err?.message || err,
+            });
+          }
+        }
+      }
+    }
+    
     const totalPieceCount =
       boardIds.length *
       orderedPieces.reduce(
@@ -801,12 +955,29 @@ router.post('/', async (req, res) => {
           const existingBoardPath = shouldCopyExisting ? path.join(resumeSourceDir, boardId, 'board') : null;
           let copiedFromExisting = false;
           
+          log('writeBoardAsset paths', {
+            packId,
+            boardId,
+            shouldCopyExisting,
+            existingBoardPath,
+            newBoardPath: boardPath,
+          });
+          
           if (existingBoardPath) {
             try {
               const existingBgPath = path.join(existingBoardPath, 'background.svg');
               const existingLightPath = path.join(existingBoardPath, 'tileLight.svg');
               const existingDarkPath = path.join(existingBoardPath, 'tileDark.svg');
               const existingPreviewPath = path.join(existingBoardPath, 'preview.svg');
+              
+              log('writeBoardAsset checking files', {
+                packId,
+                boardId,
+                existingBgPath,
+                existingLightPath,
+                existingDarkPath,
+                existingPreviewPath,
+              });
               
               // Check if all required files exist
               const [bgExists, lightExists, darkExists, previewExists] = await Promise.all([
@@ -816,8 +987,19 @@ router.post('/', async (req, res) => {
                 pathExists(existingPreviewPath),
               ]);
               
+              log('writeBoardAsset file existence check', {
+                packId,
+                boardId,
+                bgExists,
+                lightExists,
+                darkExists,
+                previewExists,
+                allExist: bgExists && lightExists && darkExists && previewExists,
+              });
+              
               if (bgExists && lightExists && darkExists && previewExists) {
                 // Copy all board assets from existing pack
+                log('writeBoardAsset copying files', { packId, boardId, from: resumePackIdClean });
                 await Promise.all([
                   fs.copyFile(existingBgPath, path.join(boardPath, 'background.svg')),
                   fs.copyFile(existingLightPath, path.join(boardPath, 'tileLight.svg')),
@@ -849,14 +1031,36 @@ router.post('/', async (req, res) => {
                 
                 copiedFromExisting = true;
                 log('copied existing board assets', { packId, boardId, from: resumePackIdClean });
+              } else {
+                log('writeBoardAsset skipping copy - not all files exist', {
+                  packId,
+                  boardId,
+                  bgExists,
+                  lightExists,
+                  darkExists,
+                  previewExists,
+                });
               }
             } catch (err) {
-              log('failed to copy existing board assets, will regenerate', { packId, boardId, error: err?.message });
+              log('failed to copy existing board assets, will regenerate', { 
+                packId, 
+                boardId, 
+                error: err?.message,
+                stack: err?.stack,
+              });
             }
+          } else {
+            log('writeBoardAsset no existingBoardPath', { packId, boardId });
           }
           
           // Only generate if we didn't copy from existing
           if (!copiedFromExisting) {
+            log('writeBoardAsset generating new assets', { 
+              packId, 
+              boardId,
+              reason: existingBoardPath ? 'copy failed or files missing' : 'no resume pack',
+            });
+            
             const light = theme?.p1Color || '#e8e8e8';
             const dark = theme?.p2Color || '#d8d8d8';
             const accent = theme?.accent || '#ffd60a';
