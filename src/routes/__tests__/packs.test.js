@@ -11,6 +11,8 @@ import path from 'path';
 import fs from 'fs/promises';
 import os from 'os';
 
+import { cleanupOldPacksForGame, writePackMeta, validateCreatePackPayload } from '../packs.js';
+
 /**
  * Helper: Create a temporary directory for test packs
  */
@@ -22,9 +24,16 @@ async function createTestPacksDir() {
 /**
  * Helper: Create a mock pack directory with manifest
  */
-async function createMockPack(packsDir, packName) {
+async function createMockPack(packsDir, packName, { gameId = null, createdAt = null } = {}) {
   const packPath = path.join(packsDir, packName);
   await fs.mkdir(packPath, { recursive: true });
+  if (gameId) {
+    await writePackMeta(packPath, {
+      packId: packName,
+      gameId,
+      createdAt: createdAt ?? Date.now(),
+    });
+  }
   await fs.writeFile(
     path.join(packPath, 'manifest.json'),
     JSON.stringify({ packId: packName, complete: true }),
@@ -46,49 +55,34 @@ async function packExists(packsDir, packName) {
 }
 
 test('Asset Pack Cleanup', async (suite) => {
-  await suite.test('Auto-cleanup: Keep 2 most recent packs and delete older ones', async () => {
+  await suite.test('Auto-cleanup: Keep 2 most recent packs per game', async () => {
     const testPacksDir = await createTestPacksDir();
     try {
-      // Create 4 packs with increasing timestamps
-      const pack1 = 'pack_1000_ABC';
-      const pack2 = 'pack_2000_DEF';
-      const pack3 = 'pack_3000_GHI';
-      const pack4 = 'pack_4000_JKL';
+      const gameA = 'game-a';
+      const gameB = 'game-b';
 
-      await createMockPack(testPacksDir, pack1);
-      await createMockPack(testPacksDir, pack2);
-      await createMockPack(testPacksDir, pack3);
-      await createMockPack(testPacksDir, pack4);
+      const a1 = 'pack_1000_A1';
+      const a2 = 'pack_2000_A2';
+      const a3 = 'pack_3000_A3';
+      const b1 = 'pack_1500_B1';
+      const b2 = 'pack_2500_B2';
 
-      // Execute cleanup logic
-      const items = await fs.readdir(testPacksDir, { withFileTypes: true });
-      const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
-      
-      const gamePacksInfo = allPacks
-        .filter(name => name.startsWith('pack_'))
-        .map(name => {
-          const parts = name.split('_');
-          const timestamp = parts.length > 1 ? Number(parts[1]) : 0;
-          return { name, timestamp };
-        })
-        .sort((a, b) => b.timestamp - a.timestamp);
+      await createMockPack(testPacksDir, a1, { gameId: gameA, createdAt: 1000 });
+      await createMockPack(testPacksDir, a2, { gameId: gameA, createdAt: 2000 });
+      await createMockPack(testPacksDir, a3, { gameId: gameA, createdAt: 3000 });
+      await createMockPack(testPacksDir, b1, { gameId: gameB, createdAt: 1500 });
+      await createMockPack(testPacksDir, b2, { gameId: gameB, createdAt: 2500 });
 
-      const keepLatest = 2;
-      if (gamePacksInfo.length > keepLatest) {
-        const toDelete = gamePacksInfo.slice(keepLatest);
-        for (const { name } of toDelete) {
-          const packPath = path.join(testPacksDir, name);
-          await fs.rm(packPath, { recursive: true, force: true });
-        }
-      }
+      await cleanupOldPacksForGame(gameA, testPacksDir, 2);
 
-      // Verify: 2 newest packs still exist
-      assert.strictEqual(await packExists(testPacksDir, pack4), true);
-      assert.strictEqual(await packExists(testPacksDir, pack3), true);
+      // Game A: keep 2 newest, delete oldest
+      assert.strictEqual(await packExists(testPacksDir, a3), true);
+      assert.strictEqual(await packExists(testPacksDir, a2), true);
+      assert.strictEqual(await packExists(testPacksDir, a1), false);
 
-      // Verify: 2 oldest packs are deleted
-      assert.strictEqual(await packExists(testPacksDir, pack1), false);
-      assert.strictEqual(await packExists(testPacksDir, pack2), false);
+      // Game B unaffected
+      assert.strictEqual(await packExists(testPacksDir, b1), true);
+      assert.strictEqual(await packExists(testPacksDir, b2), true);
     } finally {
       await fs.rm(testPacksDir, { recursive: true, force: true });
     }
@@ -97,30 +91,17 @@ test('Asset Pack Cleanup', async (suite) => {
   await suite.test('Auto-cleanup: Preserve all packs when count ≤ keepLatest', async () => {
     const testPacksDir = await createTestPacksDir();
     try {
-      const pack1 = 'pack_1000_ABC';
-      const pack2 = 'pack_2000_DEF';
+      const gameA = 'game-a';
+      const pack1 = 'pack_1000_A';
+      const pack2 = 'pack_2000_B';
 
-      await createMockPack(testPacksDir, pack1);
-      await createMockPack(testPacksDir, pack2);
+      await createMockPack(testPacksDir, pack1, { gameId: gameA, createdAt: 1000 });
+      await createMockPack(testPacksDir, pack2, { gameId: gameA, createdAt: 2000 });
 
-      const items = await fs.readdir(testPacksDir, { withFileTypes: true });
-      const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
-      
-      const gamePacksInfo = allPacks
-        .filter(name => name.startsWith('pack_'))
-        .map(name => {
-          const parts = name.split('_');
-          const timestamp = parts.length > 1 ? Number(parts[1]) : 0;
-          return { name, timestamp };
-        })
-        .sort((a, b) => b.timestamp - a.timestamp);
-
-      const keepLatest = 2;
-      const deletedCount = gamePacksInfo.length > keepLatest ? gamePacksInfo.length - keepLatest : 0;
+      await cleanupOldPacksForGame(gameA, testPacksDir, 2);
 
       assert.strictEqual(await packExists(testPacksDir, pack1), true);
       assert.strictEqual(await packExists(testPacksDir, pack2), true);
-      assert.strictEqual(deletedCount, 0);
     } finally {
       await fs.rm(testPacksDir, { recursive: true, force: true });
     }
@@ -139,41 +120,64 @@ test('Asset Pack Cleanup', async (suite) => {
     }
   });
 
-  await suite.test('Game deletion: Delete all packs when game is deleted', async () => {
+  await suite.test('Game deletion: Only deletes packs for that game', async () => {
     const testPacksDir = await createTestPacksDir();
     try {
-      const pack1 = 'pack_1000_ABC';
-      const pack2 = 'pack_2000_DEF';
-      const pack3 = 'pack_3000_GHI';
+      const gameA = 'game-a';
+      const gameB = 'game-b';
+      const a1 = 'pack_1000_A1';
+      const a2 = 'pack_2000_A2';
+      const b1 = 'pack_3000_B1';
 
-      await createMockPack(testPacksDir, pack1);
-      await createMockPack(testPacksDir, pack2);
-      await createMockPack(testPacksDir, pack3);
+      await createMockPack(testPacksDir, a1, { gameId: gameA, createdAt: 1000 });
+      await createMockPack(testPacksDir, a2, { gameId: gameA, createdAt: 2000 });
+      await createMockPack(testPacksDir, b1, { gameId: gameB, createdAt: 3000 });
 
+      const deleted = [];
+      const failed = [];
       const items = await fs.readdir(testPacksDir, { withFileTypes: true });
       const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
-      
       for (const packName of allPacks) {
         const packPath = path.join(testPacksDir, packName);
-        await fs.rm(packPath, { recursive: true, force: true });
+        const meta = await (async () => {
+          try {
+            const raw = await fs.readFile(path.join(packPath, 'pack-meta.json'), 'utf8');
+            return JSON.parse(raw);
+          } catch {
+            return null;
+          }
+        })();
+        if (!meta || meta.gameId !== gameA) continue;
+        try {
+          await fs.rm(packPath, { recursive: true, force: true });
+          deleted.push(packName);
+        } catch {
+          failed.push(packName);
+        }
       }
 
-      assert.strictEqual(await packExists(testPacksDir, pack1), false);
-      assert.strictEqual(await packExists(testPacksDir, pack2), false);
-      assert.strictEqual(await packExists(testPacksDir, pack3), false);
+      assert.strictEqual(await packExists(testPacksDir, a1), false);
+      assert.strictEqual(await packExists(testPacksDir, a2), false);
+      assert.strictEqual(await packExists(testPacksDir, b1), true);
+      assert.strictEqual(deleted.length, 2);
+      assert.strictEqual(failed.length, 0);
     } finally {
       await fs.rm(testPacksDir, { recursive: true, force: true });
     }
   });
 
-  await suite.test('Game deletion: Report deleted and failed packs correctly', async () => {
+  await suite.test('Game deletion: Reports deleted packs correctly', async () => {
     const testPacksDir = await createTestPacksDir();
     try {
-      const pack1 = 'pack_1000_ABC';
-      const pack2 = 'pack_2000_DEF';
+      const gameA = 'game-a';
+      const gameB = 'game-b';
+      const pack1 = 'pack_1000_A';
+      const pack2 = 'pack_2000_A';
+      const pack3 = 'pack_3000_B';
 
-      await createMockPack(testPacksDir, pack1);
-      await createMockPack(testPacksDir, pack2);
+      await createMockPack(testPacksDir, pack1, { gameId: gameA, createdAt: 1000 });
+      await createMockPack(testPacksDir, pack2, { gameId: gameA, createdAt: 2000 });
+      await createMockPack(testPacksDir, pack3, { gameId: gameB, createdAt: 3000 });
 
       const deleted = [];
       const failed = [];
@@ -184,6 +188,9 @@ test('Asset Pack Cleanup', async (suite) => {
       for (const packName of allPacks) {
         const packPath = path.join(testPacksDir, packName);
         try {
+          const metaRaw = await fs.readFile(path.join(packPath, 'pack-meta.json'), 'utf8').catch(() => null);
+          const meta = metaRaw ? JSON.parse(metaRaw) : null;
+          if (!meta || meta.gameId !== gameA) continue;
           await fs.rm(packPath, { recursive: true, force: true });
           deleted.push(packName);
         } catch (err) {
@@ -195,8 +202,26 @@ test('Asset Pack Cleanup', async (suite) => {
       assert.strictEqual(failed.length, 0);
       assert(deleted.includes(pack1));
       assert(deleted.includes(pack2));
+      assert.strictEqual(await packExists(testPacksDir, pack3), true);
     } finally {
       await fs.rm(testPacksDir, { recursive: true, force: true });
     }
+  });
+});
+
+test('Pack Payload Validation', async (suite) => {
+  await suite.test('allows null token placeholders in existingBoardAssets', async () => {
+    const { error } = validateCreatePackPayload({
+      gameId: 'game-a',
+      existingBoardAssets: {
+        'board-1': {
+          tokens: {
+            p1: null,
+            p2: '',
+          },
+        },
+      },
+    });
+    assert.strictEqual(error, undefined);
   });
 });

@@ -1,97 +1,67 @@
 // service-assets/src/services/progressHub.js
-// Simple in-memory hub to manage Server-Sent Events (SSE) progress streams.
+// Socket-driven progress hub (SSE removed).
 
-const channels = new Map(); // channelId -> { clients:Set, buffer:Array, abort?:AbortController }
-const HEARTBEAT_INTERVAL_MS = 25_000;
-const BUFFER_LIMIT = 200;
+const channelToGame = new Map(); // channelId -> gameId
+const abortControllers = new Map(); // channelId -> AbortController
+let ioRef = null;
 
-function ensureChannel(channelId) {
-  if (!channels.has(channelId)) {
-    channels.set(channelId, {
-      clients: new Set(),
-      buffer: [],
-    });
-  }
-  return channels.get(channelId);
+export function setProgressSocketServer(io) {
+  ioRef = io;
 }
 
-export function registerClient(channelId, res) {
-  const entry = ensureChannel(channelId);
-  entry.clients.add(res);
+function channelRoom(channelId) {
+  return channelId ? `asset-progress:${channelId}` : null;
+}
 
-  // Replay buffered events so late subscribers catch up.
-  if (Array.isArray(entry.buffer)) {
-    entry.buffer.forEach(({ event, data }) => {
-      try {
-        res.write(`event: ${event}\n`);
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-      } catch {
-        // ignore write errors during replay
-      }
-    });
-  }
+function gameRoom(gameId) {
+  return gameId ? `asset-progress:game:${gameId}` : null;
+}
 
-  const heartbeat = setInterval(() => {
-    try {
-      res.write(`event: heartbeat\ndata: {}\n\n`);
-    } catch {
-      clearInterval(heartbeat);
-    }
-  }, HEARTBEAT_INTERVAL_MS);
-
-  res.on('close', () => {
-    clearInterval(heartbeat);
-    const updated = channels.get(channelId);
-    if (!updated) return;
-    updated.clients.delete(res);
-    if (updated.clients.size === 0) {
-      channels.delete(channelId);
-    }
-  });
+export function registerProgressChannel(channelId, gameId) {
+  if (!channelId || !gameId) return;
+  channelToGame.set(String(channelId), String(gameId));
 }
 
 export function attachAbortController(channelId, controller) {
   if (!channelId || !controller) return;
-  const entry = ensureChannel(channelId);
-  entry.abort = controller;
+  abortControllers.set(String(channelId), controller);
 }
 
 export function emitProgress(channelId, event, data) {
-  if (!channelId) return;
-  const entry = ensureChannel(channelId);
-  if (event === 'cancelled' && entry.abort) {
-    try {
-      entry.abort.abort();
-    } catch {}
-  }
-  entry.buffer.push({ event, data });
-  if (entry.buffer.length > BUFFER_LIMIT) entry.buffer.shift();
-
-  const serialized = JSON.stringify(data);
-  for (const res of entry.clients) {
-    try {
-      res.write(`event: ${event}\n`);
-      res.write(`data: ${serialized}\n\n`);
-    } catch {
-      entry.clients.delete(res);
+  if (!channelId || !ioRef) return;
+  const room = channelRoom(String(channelId));
+  if (!room) return;
+  const gameId = data?.gameId ? String(data.gameId) : channelToGame.get(String(channelId)) || null;
+  const gameRoomKey = gameRoom(gameId);
+  if (event === 'cancelled') {
+    const controller = abortControllers.get(String(channelId));
+    if (controller) {
+      try {
+        controller.abort();
+      } catch {}
     }
   }
-
-  if (entry.clients.size === 0) {
-    channels.delete(channelId);
+  ioRef.to(room).emit('asset-progress', { event, data });
+  if (gameRoomKey) {
+    ioRef.to(gameRoomKey).emit('asset-progress', { event, data });
   }
 }
 
+export function getClientCount(channelId, gameId = null) {
+  if (!ioRef) return 0;
+  const channel = channelId ? String(channelId) : null;
+  const gid = gameId ? String(gameId) : channelToGame.get(channel || '') || null;
+  const channelKey = channel ? channelRoom(channel) : null;
+  const gameKey = gameRoom(gid);
+  const channelSize = channelKey ? ioRef.sockets?.adapter?.rooms?.get(channelKey)?.size : 0;
+  const gameSize = gameKey ? ioRef.sockets?.adapter?.rooms?.get(gameKey)?.size : 0;
+  return (channelSize || 0) + (gameSize || 0);
+}
+
 export function closeChannel(channelId) {
-  if (!channelId) return;
-  const entry = channels.get(channelId);
-  if (!entry) return;
-  for (const res of entry.clients) {
-    try {
-      res.end();
-    } catch {
-      // ignore
-    }
-  }
-  channels.delete(channelId);
+  if (!channelId || !ioRef) return;
+  const room = channelRoom(String(channelId));
+  if (!room) return;
+  ioRef.to(room).emit('asset-progress', { event: 'close', data: { channelId } });
+  abortControllers.delete(String(channelId));
 }

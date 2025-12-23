@@ -9,20 +9,128 @@ import { generatePhotoSpriteSVG } from '../services/photoSpriteGenerator.js';
 import { sanitizePrompt } from '../lib/sanitizePrompt.js';
 import { renderChessPieceSVG, renderCoverSVG, renderTokenSVG, renderBackgroundSVG, renderTileSVG } from '../tri/svgTemplates.js';
 import {
-  registerClient,
   emitProgress,
   closeChannel,
   attachAbortController,
+  getClientCount,
 } from '../services/progressHub.js';
 import { normalizeIdentifier, formatIdentifier } from '../types/assetIdentifier.js';
 
 const router = Router();
 const log = (...msg) => console.log(new Date().toISOString(), '[packs]', ...msg);
 
-const pendingJobs = new Map(); // gameId -> { controller, progressChannel, packId, startedAt }
-const jobStates = new Map(); // gameId -> { packId, renderStyle, baseUrl, manifestUrl, progressChannel, active, pieces, updatedAt }
-const jobAdvanceGates = new Map(); // progressChannel -> { pending, awaiting, resolve, timer, cancelled }
-const ADVANCE_TIMEOUT_MS = Math.max(1000, Number(process.env.ASSETS_ADVANCE_TIMEOUT_MS || 15000));
+export const pendingJobs = new Map(); // gameId -> { controller, progressChannel, packId, startedAt }
+export const jobStates = new Map(); // gameId -> { ownerUserId?, packId, renderStyle, baseUrl, manifestUrl, progressChannel, active, pieces, boardAssets, activePiece, updatedAt }
+
+const WAIT_FOR_CLIENT_ADVANCE = String(process.env.WAIT_FOR_CLIENT_ADVANCE || 'true').toLowerCase() !== 'false';
+const CLIENT_ADVANCE_TIMEOUT_MS = Math.max(
+  0,
+  Number(process.env.CLIENT_ADVANCE_TIMEOUT_MS || 8000),
+);
+
+// progressChannel -> { count:number, waiters:Set<Function> }
+const advanceState = new Map();
+
+const emitProgressWithGame = (channelId, event, payload, gameId) =>
+  emitProgress(channelId, event, { ...(payload || {}), gameId: gameId || null });
+
+function signalClientAdvance(progressChannel) {
+  if (!progressChannel) return;
+  const entry = advanceState.get(progressChannel) || { count: 0, waiters: new Set() };
+  if (entry.waiters.size > 0) {
+    const [resolve] = entry.waiters;
+    entry.waiters.delete(resolve);
+    advanceState.set(progressChannel, entry);
+    try {
+      resolve(true);
+    } catch {
+      // ignore
+    }
+    return;
+  }
+  entry.count += 1;
+  advanceState.set(progressChannel, entry);
+}
+
+function waitForClientAdvance(progressChannel, { signal, timeoutMs = CLIENT_ADVANCE_TIMEOUT_MS } = {}) {
+  if (!progressChannel) return Promise.resolve(false);
+  const entry = advanceState.get(progressChannel) || { count: 0, waiters: new Set() };
+  if (entry.count > 0) {
+    entry.count = Math.max(0, entry.count - 1);
+    advanceState.set(progressChannel, entry);
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      try {
+        entry.waiters.delete(finish);
+      } catch {}
+      try {
+        resolve(result);
+      } catch {}
+    };
+
+    // Store waiter
+    entry.waiters.add(finish);
+    advanceState.set(progressChannel, entry);
+
+    timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            finish(false);
+          }, timeoutMs)
+        : null;
+
+    if (signal && typeof signal.addEventListener === 'function') {
+      const onAbort = () => {
+        finish(false);
+      };
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+export function sanitizeUserId(value) {
+  const raw = typeof value === 'string' ? value : value == null ? '' : String(value);
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const safe = trimmed.replace(/[^a-zA-Z0-9_-]/g, '');
+  return safe || null;
+}
+
+function getRequestUserId(req) {
+  const fromQuery = sanitizeUserId(req?.query?.userId);
+  if (fromQuery) return fromQuery;
+  const fromBody = sanitizeUserId(req?.body?.userId);
+  if (fromBody) return fromBody;
+  const fromHeader = sanitizeUserId(req?.headers?.['x-user-id']);
+  if (fromHeader) return fromHeader;
+  return null;
+}
+
+function assertOwnerOr403(req, res, state) {
+  const owner = sanitizeUserId(state?.ownerUserId);
+  if (!owner) return true; // owner enforcement disabled when ownerUserId is absent
+  const requestUserId = getRequestUserId(req);
+  if (!requestUserId || requestUserId !== owner) {
+    res.status(403).json({ ok: false, error: 'Forbidden' });
+    return false;
+  }
+  return true;
+}
 
 function trackPendingJob(gameId, job) {
   if (!gameId) return;
@@ -50,20 +158,44 @@ function seedJobState(gameId, seed) {
   });
 }
 
-function updateJobPieceState(gameId, role, variant, patch = {}) {
+function emitStateSnapshot(gameId) {
+  if (!gameId) return;
+  const state = jobStates.get(String(gameId));
+  if (!state) return;
+  const channel = state.progressChannel ? String(state.progressChannel).trim() : null;
+  if (!channel) return;
+  emitProgressWithGame(channel, 'state', serializeJobState(state), gameId);
+}
+
+function updateJobPieceState(gameId, boardId, role, variant, patch = {}) {
   if (!gameId) return;
   const state = jobStates.get(String(gameId));
   if (!state) return;
   if (!state.pieces) state.pieces = {};
-  const pieceKey = `${role}-${variant}`;
-  const existing = state.pieces?.[pieceKey] || { role, variant };
+  const normalizedRole = String(role || '').trim();
+  const normalizedBoardId = boardId ? String(boardId).trim() : null;
+  const normalizedVariant = variant == null ? null : String(variant).trim().toLowerCase();
+  const pieceKey = formatIdentifier({
+    role: normalizedRole,
+    boardId: normalizedBoardId,
+    variant: normalizedVariant === 'main' ? null : normalizedVariant,
+  });
+  const existing = state.pieces?.[pieceKey] || {
+    id: pieceKey,
+    role: normalizedRole,
+    boardId: normalizedBoardId,
+    variant: normalizedVariant,
+  };
   state.pieces[pieceKey] = {
     ...existing,
     ...patch,
-    role,
-    variant,
+    id: pieceKey,
+    role: normalizedRole,
+    boardId: normalizedBoardId,
+    variant: normalizedVariant,
   };
   state.updatedAt = Date.now();
+  emitStateSnapshot(gameId);
 }
 
 function markJobState(gameId, patch = {}) {
@@ -72,6 +204,7 @@ function markJobState(gameId, patch = {}) {
   if (!state) return;
   Object.assign(state, patch);
   state.updatedAt = Date.now();
+  emitStateSnapshot(gameId);
 }
 
 function markJobStateCancelled(gameId) {
@@ -84,21 +217,36 @@ function markJobStateCancelled(gameId) {
     piece.status = 'cancelled';
   });
   state.active = false;
+  state.activePiece = null;
+  state.progressChannel = null;
   state.updatedAt = Date.now();
+  emitStateSnapshot(gameId);
 }
 
-function serializeJobState(state) {
+export function serializeJobState(state) {
   if (!state) return null;
+  const progressChannel =
+    state.progressChannel != null && String(state.progressChannel).trim()
+      ? String(state.progressChannel).trim()
+      : null;
   return {
     packId: state.packId || null,
     renderStyle: state.renderStyle || null,
     baseUrl: state.baseUrl || null,
     manifestUrl: state.manifestUrl || null,
-    progressChannel: state.progressChannel || null,
+    progressChannel,
     resumePackId: state.resumePackId || null,
     active: Boolean(state.active),
     updatedAt: state.updatedAt || Date.now(),
     pieces: state.pieces || {},
+    boardAssets:
+      state.boardAssets && typeof state.boardAssets === 'object'
+        ? state.boardAssets
+        : null,
+    activePiece:
+      state.activePiece && typeof state.activePiece === 'object'
+        ? state.activePiece
+        : null,
     prompts: collectJobPrompts(state),
   };
 }
@@ -108,21 +256,66 @@ function serializeJobState(state) {
  * Keeps the latest N packs per gameId and deletes older ones.
  * Call after a successful pack generation.
  */
-async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2) {
+export const PACK_META_FILENAME = 'pack-meta.json';
+
+export async function readPackMeta(packDir) {
+  if (!packDir) return null;
+  try {
+    const raw = await fs.readFile(path.join(packDir, PACK_META_FILENAME), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function writePackMeta(packDir, meta) {
+  if (!packDir) return false;
+  try {
+    const payload = meta && typeof meta === 'object' ? meta : {};
+    await fs.writeFile(
+      path.join(packDir, PACK_META_FILENAME),
+      JSON.stringify(payload),
+      'utf8',
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2) {
   if (!gameId) return;
   try {
     const items = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
     const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
     
-    // Parse timestamps and group by gameId metadata (crude but works: packs are named pack_<timestamp>_<gameId>)
-    const gamePacksInfo = allPacks
-      .filter(name => name.startsWith('pack_'))
-      .map(name => {
-        const parts = name.split('_');
-        const timestamp = parts.length > 1 ? Number(parts[1]) : 0;
-        return { name, timestamp };
-      })
-      .sort((a, b) => b.timestamp - a.timestamp);
+    const normalizeGameId = (value) => String(value || '').trim();
+    const targetGameId = normalizeGameId(gameId);
+    if (!targetGameId) return;
+
+    const parseTimestampFromName = (name) => {
+      const parts = String(name || '').split('_');
+      const timestamp = parts.length > 1 ? Number(parts[1]) : 0;
+      return Number.isFinite(timestamp) ? timestamp : 0;
+    };
+
+    const gamePacksInfo = [];
+    for (const name of allPacks) {
+      if (!name.startsWith('pack_')) continue;
+      const packPath = path.join(packsDir, name);
+      const meta = await readPackMeta(packPath);
+      const metaGameId = normalizeGameId(meta?.gameId);
+      if (!metaGameId || metaGameId !== targetGameId) continue;
+      const createdAt =
+        Number.isFinite(Number(meta?.createdAt)) && Number(meta.createdAt) > 0
+          ? Number(meta.createdAt)
+          : parseTimestampFromName(name);
+      gamePacksInfo.push({ name, createdAt });
+    }
+
+    gamePacksInfo.sort((a, b) => b.createdAt - a.createdAt);
     
     // Keep the latest `keepLatest` packs, delete the rest
     if (gamePacksInfo.length > keepLatest) {
@@ -140,76 +333,6 @@ async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2) {
   } catch (err) {
     log('cleanup old packs failed', { gameId, error: err?.message || err });
   }
-}
-
-function initAdvanceGate(channel) {
-  if (!channel) return null;
-  const key = String(channel);
-  if (!jobAdvanceGates.has(key)) {
-    jobAdvanceGates.set(key, {
-      pending: 0,
-      awaiting: false,
-      resolve: null,
-      timer: null,
-      cancelled: false,
-    });
-  }
-  return jobAdvanceGates.get(key);
-}
-
-function cleanupAdvanceGate(channel) {
-  if (!channel) return;
-  const gate = jobAdvanceGates.get(String(channel));
-  if (!gate) return;
-  gate.cancelled = true;
-  if (gate.timer) {
-    clearTimeout(gate.timer);
-    gate.timer = null;
-  }
-  if (gate.resolve) {
-    gate.resolve({ type: 'cancelled' });
-    gate.resolve = null;
-  }
-  jobAdvanceGates.delete(String(channel));
-}
-
-function signalAdvanceGate(channel) {
-  if (!channel) return false;
-  const gate = jobAdvanceGates.get(String(channel));
-  if (!gate) return false;
-  if (gate.awaiting && typeof gate.resolve === 'function') {
-    gate.resolve({ type: 'advance' });
-  } else {
-    gate.pending += 1;
-  }
-  return true;
-}
-
-async function waitForAdvanceGate(channel) {
-  if (!channel) return { type: 'auto' };
-  const gate = initAdvanceGate(channel);
-  if (!gate || gate.cancelled) return { type: 'auto' };
-  if (gate.pending > 0) {
-    gate.pending -= 1;
-    return { type: 'queued' };
-  }
-  gate.awaiting = true;
-  return new Promise((resolve) => {
-    gate.resolve = resolve;
-    gate.timer = setTimeout(() => {
-      gate.awaiting = false;
-      gate.resolve = null;
-      gate.timer = null;
-      resolve({ type: 'timeout' });
-    }, ADVANCE_TIMEOUT_MS);
-  }).finally(() => {
-    gate.awaiting = false;
-    if (gate.timer) {
-      clearTimeout(gate.timer);
-      gate.timer = null;
-    }
-    gate.resolve = null;
-  });
 }
 
 function collectJobPrompts(state) {
@@ -248,9 +371,11 @@ function buildPiecesState(piecesList = []) {
 }
 
 const createSchema = Joi.object({
+  userId: Joi.string().allow('', null),
   gameId: Joi.string().allow('', null),
   gameName: Joi.string().allow('', null),
   stylePrompt: Joi.string().allow('', null),
+  assetGenerationLocation: Joi.string().valid('local', 'remote').allow('', null),
   renderStyle: Joi.string().valid('vector', 'photoreal').default('vector'),
   progressChannel: Joi.string().allow('', null),
   theme: Joi.object({
@@ -289,36 +414,27 @@ const createSchema = Joi.object({
       background: Joi.string().allow('', null),
       tileLight: Joi.string().allow('', null),
       tileDark: Joi.string().allow('', null),
-      tokens: Joi.object().pattern(Joi.string(), Joi.string()),
+      tokens: Joi.object().pattern(Joi.string(), Joi.string().allow('', null)),
     })
   ).default({}), // Existing board assets with URLs to copy from
   size: Joi.number().integer().min(64).max(1024).default(512), // SVG viewBox (square)
   resumePackId: Joi.string().allow('', null),
   reuseExistingPack: Joi.boolean().default(false),
-  awaitClientAdvance: Joi.boolean().default(false),
+  reuseExistingPieces: Joi.boolean().default(true),
   vectorProvider: Joi.string().valid('auto', 'openai', 'local').default('auto'),
 });
+
+export function validateCreatePackPayload(body) {
+  return createSchema.validate(body || {}, { stripUnknown: true });
+}
 
 function fileUrl(base, ...p) {
   const joined = ['','skins', ...p].join('/').replace(/\/+/g, '/');
   return base ? `${base}${joined}` : joined; // base is the apache-proxied origin
 }
 
-router.get('/progress/:channelId', (req, res) => {
-  const { channelId } = req.params;
-  if (!channelId) {
-    res.status(400).json({ ok: false, error: 'Channel id required' });
-    return;
-  }
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-  });
-  if (typeof res.flushHeaders === 'function') res.flushHeaders();
-  res.write(`event: connected\ndata: {"channel":"${channelId}"}\n\n`);
-  registerClient(channelId, res);
-});
+// NOTE: define /progress/by-game before /progress/:channelId so Express doesn't treat "by-game"
+// as a channel id.
 
 function sortFilesMap(files = {}) {
   const sorted = {};
@@ -412,6 +528,8 @@ router.post('/jobs/cancel', (req, res) => {
     return;
   }
   const key = String(gameId);
+  const state = jobStates.get(key);
+  if (state && !assertOwnerOr403(req, res, state)) return;
   const job = pendingJobs.get(key);
   if (!job) {
     res.json({ ok: true, cancelled: false, message: 'no active job for gameId' });
@@ -421,41 +539,47 @@ router.post('/jobs/cancel', (req, res) => {
   markJobStateCancelled(key);
   const { progressChannel, controller, packId } = job;
   log('cancel job request', { gameId: key, progressChannel, packId });
-  if (progressChannel) {
-    cleanupAdvanceGate(progressChannel);
-  }
   try {
     if (controller) controller.abort();
   } catch (err) {
     log('cancel job controller abort failed', err?.message || err);
   }
   if (progressChannel) {
-    emitProgress(progressChannel, 'cancelled', {
-      packId,
-      gameId: key,
-      reason,
-    });
+    emitProgressWithGame(progressChannel, 'cancelled', { packId, reason }, key);
     closeChannel(progressChannel);
   }
   res.json({ ok: true, cancelled: true, gameId: key });
 });
 
 router.post('/jobs/advance', (req, res) => {
-  const { progressChannel } = req.body || {};
-  if (!progressChannel) {
+  const { progressChannel, gameId } = req.body || {};
+  const channel =
+    typeof progressChannel === 'string' && progressChannel.trim()
+      ? progressChannel.trim()
+      : null;
+  if (!channel) {
     res.status(400).json({ ok: false, error: 'progressChannel required' });
     return;
   }
-  const gate = jobAdvanceGates.get(String(progressChannel));
-  if (!gate) {
-    res.json({ ok: false, error: 'no job waiting on this channel' });
+
+  const key = gameId ? String(gameId) : null;
+  const state = key ? jobStates.get(key) : null;
+  const pending = key ? pendingJobs.get(key) : null;
+  const effectiveState = state || pending || null;
+  if (effectiveState && !assertOwnerOr403(req, res, effectiveState)) return;
+
+  // If we have a gameId, ensure the channel matches the running job.
+  const expectedChannel =
+    (state?.progressChannel && String(state.progressChannel).trim()) ||
+    (pending?.progressChannel && String(pending.progressChannel).trim()) ||
+    null;
+  if (expectedChannel && expectedChannel !== channel) {
+    res.status(409).json({ ok: false, error: 'progressChannel does not match active job' });
     return;
   }
-  const advanced = signalAdvanceGate(progressChannel);
-  res.json({
-    ok: true,
-    advanced: advanced ? true : false,
-  });
+
+  signalClientAdvance(channel);
+  res.json({ ok: true, advanced: true });
 });
 
 router.get('/jobs/status/:gameId', (req, res) => {
@@ -471,6 +595,8 @@ router.get('/jobs/status/:gameId', (req, res) => {
     ETag: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
   });
   const key = String(gameId);
+  const state = jobStates.get(key);
+  if (state && !assertOwnerOr403(req, res, state)) return;
   const job = pendingJobs.get(key);
   if (!job) {
     res.json({ ok: true, active: false, gameId: key });
@@ -495,6 +621,7 @@ router.get('/state/:gameId', (req, res) => {
   }
   const key = String(gameId);
   const state = jobStates.get(key);
+  if (state && !assertOwnerOr403(req, res, state)) return;
   res.set({
     'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
     Pragma: 'no-cache',
@@ -516,6 +643,7 @@ router.get('/jobs/state/:gameId', (req, res) => {
   }
   const key = String(gameId);
   const state = jobStates.get(key);
+  if (state && !assertOwnerOr403(req, res, state)) return;
   res.set({
     'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
     Pragma: 'no-cache',
@@ -542,13 +670,15 @@ router.get('/:id', async (req, res) => {
 });
 
 router.post('/', async (req, res) => {
-  const { value, error } = createSchema.validate(req.body || {}, { stripUnknown: true });
+  const { value, error } = validateCreatePackPayload(req.body);
   if (error) return res.status(400).json({ ok: false, error: error.message });
 
   const {
+    userId = null,
     gameId = null,
     gameName = null,
     stylePrompt = '',
+    assetGenerationLocation = null,
     progressChannel = null,
     renderStyle = 'vector',
     theme,
@@ -559,18 +689,31 @@ router.post('/', async (req, res) => {
     size,
     resumePackId = null,
     reuseExistingPack = false,
-    awaitClientAdvance = false,
+    reuseExistingPieces = true,
     vectorProvider = 'auto',
   } = value;
+  let effectiveVectorProvider = vectorProvider;
+  const normalizedLocation =
+    typeof assetGenerationLocation === 'string' && assetGenerationLocation.trim()
+      ? assetGenerationLocation.trim().toLowerCase()
+      : null;
+  if (renderStyle === 'vector' && normalizedLocation === 'local') {
+    effectiveVectorProvider = 'local';
+  }
+  const ownerUserId = sanitizeUserId(userId);
   const packsDir = req.app.get('packsDir');
   const mergedPrompt = [gameName, stylePrompt].map((s) => (s || '').trim()).filter(Boolean).join(' — ');
   const pendingKey = gameId ? String(gameId) : null;
   const resumePackIdClean = resumePackId && typeof resumePackId === 'string'
     ? resumePackId.trim()
     : null;
-  const providerPreference = renderStyle === 'vector' ? vectorProvider : 'auto';
+  const providerPreference = renderStyle === 'vector' ? effectiveVectorProvider : 'auto';
   const willUseOpenAI = renderStyle === 'vector' && isOpenAiSvgAvailable(providerPreference);
   const openAiEnv = getOpenAiSvgEnv();
+  const progressChannelResolved =
+    typeof progressChannel === 'string' && progressChannel.trim()
+      ? progressChannel.trim()
+      : nanoid(12);
 
   let resumeSourceDir = null;
   if (resumePackIdClean) {
@@ -582,22 +725,25 @@ router.post('/', async (req, res) => {
     }
   }
   const allowReuseExisting = Boolean(reuseExistingPack && resumeSourceDir);
+  const allowReuseExistingPieces = Boolean(allowReuseExisting && reuseExistingPieces !== false);
 
-  if (renderStyle === 'vector' && vectorProvider === 'openai' && !isOpenAiSvgAvailable('openai')) {
+  if (renderStyle === 'vector' && effectiveVectorProvider === 'openai' && !isOpenAiSvgAvailable('openai')) {
     const msg = 'OpenAI SVG generation requested but OPENAI_API_KEY is not configured on the assets service.';
     log('openai svg unavailable', { gameId, reason: msg });
-    emitProgress(progressChannel, 'error', { packId: null, gameId, error: msg });
+    emitProgressWithGame(progressChannelResolved, 'error', { packId: null, error: msg }, gameId);
     res.status(400).json({ ok: false, error: msg });
     return;
   }
 
   if (pendingKey && pendingJobs.has(pendingKey)) {
     log('rejecting concurrent pack request', { gameId: pendingKey });
-    emitProgress(progressChannel, 'rejected', {
-      gameId: pendingKey,
-      reason: 'job_in_progress',
-    });
-    closeChannel(progressChannel);
+    emitProgressWithGame(
+      progressChannelResolved,
+      'rejected',
+      { reason: 'job_in_progress' },
+      pendingKey,
+    );
+    closeChannel(progressChannelResolved);
     res.status(409).json({
       ok: false,
       error: 'An asset generation job is already running for this game. Please wait for it to finish or cancel it first.',
@@ -616,16 +762,12 @@ router.post('/', async (req, res) => {
     packsDir,
     stylePrompt: mergedPrompt || '<none>',
     renderStyle,
-    vectorProvider,
+    vectorProvider: effectiveVectorProvider,
+    assetGenerationLocation: normalizedLocation || null,
     willUseOpenAI,
     resumePackId: resumePackIdClean || '<none>',
     reuseExisting: allowReuseExisting,
-  });
-  log('DETAILED REQUEST SHAPE', {
-    packId,
-    gameId,
-    boardsArray: JSON.stringify(boards),
-    piecesArray: JSON.stringify(pieces),
+    reuseExistingPieces: allowReuseExistingPieces,
   });
   log('DETAILED REQUEST SHAPE', {
     packId,
@@ -634,48 +776,82 @@ router.post('/', async (req, res) => {
     piecesArray: JSON.stringify(pieces),
   });
 
-  emitProgress(progressChannel, 'start', {
-    packId,
+  emitProgressWithGame(
+    progressChannelResolved,
+    'start',
+    {
+      packId,
+      size,
+      roles: pieces?.map((p) => p.role) || [],
+      boards: Array.isArray(boards) ? boards.map((b) => b?.id).filter(Boolean) : [],
+      renderStyle,
+      vectorProvider: effectiveVectorProvider,
+      vectorProviderResolved: providerPreference,
+      willUseOpenAI,
+      openAiAvailable: openAiEnv.openAiAvailable,
+      resumePackId: resumePackIdClean,
+      reuseExisting: allowReuseExisting,
+    },
     gameId,
-    size,
-    roles: pieces?.map((p) => p.role) || [],
-    boards: Array.isArray(boards) ? boards.map((b) => b?.id).filter(Boolean) : [],
-    renderStyle,
-    vectorProvider,
-    vectorProviderResolved: providerPreference,
-    willUseOpenAI,
-    openAiAvailable: openAiEnv.openAiAvailable,
-    resumePackId: resumePackIdClean,
-    reuseExisting: allowReuseExisting,
-  });
+  );
   log('job start provider', {
     gameId,
     renderStyle,
-    vectorProvider,
+    vectorProvider: effectiveVectorProvider,
     providerPreference,
     willUseOpenAI,
     openAiEnv,
   });
 
-  let gateChannel = null;
-  if (awaitClientAdvance) {
-    if (progressChannel) {
-      gateChannel = progressChannel;
-      initAdvanceGate(progressChannel);
-    } else {
-      log('awaitClientAdvance requested but missing progressChannel; ignoring flag', { gameId });
-    }
-  }
-
   let upstreamAbortController = null;
 
   try {
-    upstreamAbortController = new AbortController();
+	    upstreamAbortController = new AbortController();
+
+    if (gameId) {
+      trackPendingJob(gameId, {
+        ownerUserId,
+        controller: upstreamAbortController,
+        progressChannel: progressChannelResolved,
+        packId,
+      });
+    }
+
+    attachAbortController(progressChannelResolved, upstreamAbortController);
 
     await fs.mkdir(baseDir, { recursive: true });
-    await fs.mkdir(baseDir, { recursive: true });
+	    await writePackMeta(baseDir, {
+	      packId,
+	      gameId: gameId || null,
+	      createdAt: Date.now(),
+	    });
 
-    let boardAssets = {};  // Use 'let' to allow recreation if frozen
+	    let boardAssets = {};  // Use 'let' to allow recreation if frozen
+    const rewriteAssetUrl = (value) => {
+      if (typeof value !== 'string') return value;
+      return value.replace(/\/skins\/pack_[^/]+/g, `/skins/${packId}`);
+    };
+    const rewriteBoardAssets = (input) => {
+      if (!input || typeof input !== 'object') return {};
+      const out = {};
+      Object.entries(input).forEach(([boardId, entry]) => {
+        if (!entry || typeof entry !== 'object') return;
+        const next = {};
+        Object.entries(entry).forEach(([key, value]) => {
+          if (key === 'tokens' && value && typeof value === 'object') {
+            const tokens = {};
+            Object.entries(value).forEach(([tokenKey, tokenUrl]) => {
+              tokens[tokenKey] = rewriteAssetUrl(tokenUrl);
+            });
+            next.tokens = tokens;
+            return;
+          }
+          next[key] = rewriteAssetUrl(value);
+        });
+        out[boardId] = next;
+      });
+      return out;
+    };
     // legacy write helpers to keep old paths alive until frontend fully per-board
     const boardsMap = Array.isArray(boards)
       ? boards.reduce((acc, b) => {
@@ -692,12 +868,6 @@ router.post('/', async (req, res) => {
           return acc;
         }, {})
       : {};
-    log('BOARDS MAP CONSTRUCTED', {
-      packId,
-      gameId,
-      boardsMapKeys: Object.keys(boardsMap),
-      boardsMapShape: JSON.stringify(boardsMap),
-    });
     log('BOARDS MAP CONSTRUCTED', {
       packId,
       gameId,
@@ -722,36 +892,33 @@ router.post('/', async (req, res) => {
           })
       : [];
     let cancelled = false;
+    let stateBroadcastTimer = null; // Timer for periodic state broadcasts during generation
     const markCancelled = (reason = 'requested') => {
       if (cancelled) return;
       cancelled = true;
       log('pack generation marked cancelled', { packId, gameId, reason });
     };
-    if (progressChannel) {
-      attachAbortController(progressChannel, upstreamAbortController);
-    }
     const onControllerAbort = () => {
       markCancelled('abort-signal');
     };
     upstreamAbortController.signal.addEventListener('abort', onControllerAbort);
-    const abortHandler = () => {
-      if (cancelled) return;
-      markCancelled('client-abort');
-      upstreamAbortController.abort();
-      emitProgress(progressChannel, 'cancelled', { packId });
-      closeChannel(progressChannel);
-      clearPendingJob(gameId, upstreamAbortController);
-    };
-    req.on('aborted', abortHandler);
-    req.on('close', abortHandler);
+    // Do not cancel generation if the upstream HTTP client disconnects.
+    // Cancellation is explicit via /packs/jobs/cancel.
 
-    if (gameId) {
-      trackPendingJob(gameId, {
-        controller: upstreamAbortController,
-        progressChannel,
-        packId,
+    const maybeWaitForClient = async ({ boardId, role, variant } = {}) => {
+      if (!WAIT_FOR_CLIENT_ADVANCE) return;
+      if (cancelled) return;
+      // If no clients are currently attached, never block generation (refresh/tab swaps should not stall).
+      if (getClientCount(progressChannelResolved) <= 0) return;
+
+      const advanced = await waitForClientAdvance(progressChannelResolved, {
+        signal: upstreamAbortController.signal,
+        timeoutMs: CLIENT_ADVANCE_TIMEOUT_MS,
       });
-    }
+      if (!advanced && !cancelled) {
+        log('client advance timeout (continuing)', { packId, gameId, boardId, role, variant });
+      }
+    };
 
     await writeManifestPartial(false);
 
@@ -895,14 +1062,144 @@ router.post('/', async (req, res) => {
         }
       }
     }
-    
+
+    if (allowReuseExisting && resumeSourceDir) {
+      if (existingBoardAssets && typeof existingBoardAssets === 'object') {
+        boardAssets = rewriteBoardAssets(existingBoardAssets);
+        log('REUSE EXISTING: seeded boardAssets from existingBoardAssets', {
+          packId,
+          gameId,
+          boardIds,
+          seededBoards: Object.keys(boardAssets || {}),
+        });
+      }
+      for (const boardId of boardIds) {
+        try {
+          const srcCover = path.join(resumeSourceDir, boardId, 'cover');
+          const destCover = path.join(baseDir, boardId, 'cover');
+          const srcPieces = path.join(resumeSourceDir, boardId, 'pieces');
+          const destPieces = path.join(baseDir, boardId, 'pieces');
+          const coverExists = await pathExists(srcCover);
+          const piecesExists = await pathExists(srcPieces);
+          if (coverExists) {
+            await fs.mkdir(destCover, { recursive: true });
+            await fs.cp(srcCover, destCover, { recursive: true });
+          }
+          if (piecesExists) {
+            await fs.mkdir(destPieces, { recursive: true });
+            await fs.cp(srcPieces, destPieces, { recursive: true });
+          }
+          log('REUSE EXISTING: copied cover/pieces', {
+            packId,
+            boardId,
+            from: resumePackIdClean,
+            coverCopied: coverExists,
+            piecesCopied: piecesExists,
+          });
+        } catch (err) {
+          log('REUSE EXISTING: failed to copy cover/pieces', {
+            packId,
+            boardId,
+            error: err?.message || err,
+          });
+        }
+      }
+    }
+
+    // Seed server-side job state so refresh/resume can show current progress + already-written URLs.
+    // This is intentionally lightweight: just statuses, prompts, and a minimal boardAssets skeleton.
+    if (gameId) {
+      const initialPieces = {};
+      const ensureBoardBucket = (out, boardId) => {
+        if (!out[boardId]) {
+          out[boardId] = {
+            boardPreview: null,
+            cover: null,
+            background: null,
+            tileLight: null,
+            tileDark: null,
+            tokens: {},
+          };
+        }
+        if (!out[boardId].tokens || typeof out[boardId].tokens !== 'object') {
+          out[boardId].tokens = {};
+        }
+        return out[boardId];
+      };
+      const initialBoardAssets = {};
+
+      boardIds.forEach((bid) => {
+        ensureBoardBucket(initialBoardAssets, bid);
+        ['board', 'background', 'tileLight', 'tileDark'].forEach((role) => {
+          const id = formatIdentifier({ role, boardId: bid, variant: null });
+          initialPieces[id] = {
+            id,
+            role,
+            boardId: bid,
+            variant: null,
+            status: 'queued',
+          };
+        });
+      });
+
+      orderedPieces.forEach((p) => {
+        const normalizedRole = String(p.role || '').toLowerCase();
+        const isCover = normalizedRole === 'cover';
+        const variants = Array.isArray(p.variants) ? p.variants : [];
+        for (const bid of boardIds) {
+          ensureBoardBucket(initialBoardAssets, bid);
+          for (const vRaw of variants) {
+            const variant = String(isCover ? 'main' : vRaw || 'p1').toLowerCase();
+            const id = formatIdentifier({
+              role: normalizedRole,
+              boardId: bid,
+              variant: variant === 'main' ? null : variant,
+            });
+            initialPieces[id] = {
+              id,
+              role: normalizedRole,
+              boardId: bid,
+              variant,
+              status: 'queued',
+              prompt:
+                typeof p.prompt === 'string' && p.prompt.trim()
+                  ? p.prompt.trim()
+                  : null,
+            };
+
+            const bucket = ensureBoardBucket(initialBoardAssets, bid);
+            if (isCover) continue;
+            if (normalizedRole === 'token') {
+              if (!(variant in bucket.tokens)) bucket.tokens[variant] = null;
+            } else {
+              const tokenKey = `${variant}-${normalizedRole}`;
+              if (!(tokenKey in bucket.tokens)) bucket.tokens[tokenKey] = null;
+            }
+          }
+        }
+      });
+
+      seedJobState(gameId, {
+        ownerUserId,
+        packId,
+        renderStyle,
+        baseUrl: `/skins/${packId}`,
+        manifestUrl: null,
+        progressChannel: progressChannelResolved,
+        active: true,
+        pieces: initialPieces,
+        boardAssets: initialBoardAssets,
+        activePiece: null,
+      });
+      emitStateSnapshot(gameId);
+    }
+
     const totalPieceCount =
       boardIds.length *
       orderedPieces.reduce(
         (sum, piece) => sum + (Array.isArray(piece.variants) ? piece.variants.length : 0),
         0,
       );
-    let remainingPieces = totalPieceCount;
     
     log('GENERATION LOOP STARTING', {
       packId,
@@ -911,31 +1208,6 @@ router.post('/', async (req, res) => {
       orderedPieces: JSON.stringify(orderedPieces.map(p => ({ role: p.role, variants: p.variants }))),
       totalPieceCount,
     });
-    
-    log('GENERATION LOOP STARTING', {
-      packId,
-      gameId,
-      boardIds: JSON.stringify(boardIds),
-      orderedPieces: JSON.stringify(orderedPieces.map(p => ({ role: p.role, variants: p.variants }))),
-      totalPieceCount,
-    });
-
-    const awaitAdvanceIfNeeded = async () => {
-      if (!gateChannel || cancelled) return true;
-      if (remainingPieces <= 0) return true;
-      const waitResult = await waitForAdvanceGate(gateChannel);
-      if (waitResult?.type === 'timeout') {
-        log('client advance timeout', { packId, gameId });
-        markCancelled('client-advance-timeout');
-        emitProgress(progressChannel, 'cancelled', { packId, gameId, reason: 'client-timeout' });
-        return false;
-      }
-      if (waitResult?.type === 'cancelled') {
-        markCancelled('client-advance-cancelled');
-        return false;
-      }
-      return true;
-    };
 
     // Generate simple procedural board assets (SVG) for boards (default at least one)
       if (boardIds.length) {
@@ -1114,6 +1386,36 @@ router.post('/', async (req, res) => {
         gameId,
         boardAssetsAfterBackgrounds: JSON.stringify(boardAssets),
       });
+      if (gameId) {
+        markJobState(gameId, { boardAssets: JSON.parse(JSON.stringify(boardAssets)) });
+        for (const bid of boardIds) {
+          const bucket = boardAssets?.[bid] || {};
+          if (bucket.boardPreview) {
+            updateJobPieceState(gameId, bid, 'board', null, {
+              status: 'ready',
+              url: bucket.boardPreview,
+            });
+          }
+          if (bucket.background) {
+            updateJobPieceState(gameId, bid, 'background', null, {
+              status: 'ready',
+              url: bucket.background,
+            });
+          }
+          if (bucket.tileLight) {
+            updateJobPieceState(gameId, bid, 'tileLight', null, {
+              status: 'ready',
+              url: bucket.tileLight,
+            });
+          }
+          if (bucket.tileDark) {
+            updateJobPieceState(gameId, bid, 'tileDark', null, {
+              status: 'ready',
+              url: bucket.tileDark,
+            });
+          }
+        }
+      }
 
       log('STARTING PIECES GENERATION', {
         packId,
@@ -1121,7 +1423,26 @@ router.post('/', async (req, res) => {
         boardIds: JSON.stringify(boardIds),
         boardAssetsBeforeLoop: JSON.stringify(boardAssets),
       });
-      
+
+      // Start periodic state broadcasts during generation to help reconnecting clients
+      // stay synchronized even when the 200-event buffer is full during long-running jobs.
+      const STATE_BROADCAST_INTERVAL_MS = Number(process.env.STATE_BROADCAST_INTERVAL_MS || 30_000);
+      if (gameId && progressChannelResolved && STATE_BROADCAST_INTERVAL_MS > 0) {
+        stateBroadcastTimer = setInterval(() => {
+          if (!cancelled) {
+            const currentState = jobStates.get(String(gameId));
+            if (currentState?.active) {
+              emitProgressWithGame(
+                progressChannelResolved,
+                'state',
+                serializeJobState(currentState),
+                gameId,
+              );
+            }
+          }
+        }, STATE_BROADCAST_INTERVAL_MS);
+      }
+
       for (const boardId of boardIds) {
         if (cancelled) break;
         const boardRoot = path.join(baseDir, boardId);
@@ -1154,7 +1475,7 @@ router.post('/', async (req, res) => {
           const filename = `${variant}.svg`;
           const filePath = path.join(roleDir, filename);
           const reuseSourcePath =
-            allowReuseExisting && resumeSourceDir
+            allowReuseExistingPieces && resumeSourceDir
               ? path.join(
                   resumeSourceDir,
                   boardId,
@@ -1174,25 +1495,51 @@ router.post('/', async (req, res) => {
           const wantsPhotoreal = renderStyle === 'photoreal';
 
           if (gameId) {
-            updateJobPieceState(gameId, normalizedRole, variant, { status: 'loading', prompt: promptForModel });
+            markJobState(gameId, {
+              activePiece: {
+                id: formatIdentifier({
+                  role: normalizedRole,
+                  boardId,
+                  variant: variant === 'main' ? null : variant,
+                }),
+                role: normalizedRole,
+                boardId,
+                variant,
+              },
+            });
+            updateJobPieceState(gameId, boardId, normalizedRole, variant, {
+              status: 'loading',
+              prompt: promptForModel,
+            });
           }
 
           if (replacements.length && Array.isArray(replacements) && replacements.length > 0) {
             log('prompt sanitized', { packId, role: p.role, variant, replacements });
-            emitProgress(progressChannel, 'notice', { packId, role: p.role, variant, replacements });
+            emitProgressWithGame(
+              progressChannelResolved,
+              'notice',
+              { packId, role: p.role, variant, replacements },
+              gameId,
+            );
           }
 
-          emitProgress(progressChannel, 'piece-start', {
-            packId,
-            role: p.role,
-            variant,
-            status: 'loading',
-            vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
-            vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
-            openai: renderStyle === 'vector' ? willUseOpenAI : null,
-            openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
-            openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
-          });
+          emitProgressWithGame(
+            progressChannelResolved,
+            'piece-start',
+            {
+              packId,
+              boardId,
+              role: p.role,
+              variant,
+              status: 'loading',
+              vectorProvider: renderStyle === 'vector' ? effectiveVectorProvider : null,
+              vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+              openai: renderStyle === 'vector' ? willUseOpenAI : null,
+              openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+              openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
+            },
+            gameId,
+          );
 
           log('generate piece', {
             packId,
@@ -1219,39 +1566,46 @@ router.post('/', async (req, res) => {
                 variant: variant === 'main' ? null : variant,
               });
               
-              boardAssets[boardId] ||= {};
-              if (isCover) {
-                boardAssets[boardId].cover = urlPath;
-              } else {
-                boardAssets[boardId].tokens ||= {};
-                boardAssets[boardId].tokens[variant] = urlPath;
-              }
+	              boardAssets[boardId] ||= {};
+	              if (isCover) {
+	                boardAssets[boardId].cover = urlPath;
+	              } else {
+	                boardAssets[boardId].tokens ||= {};
+	                const tokenKey = normalizedRole === 'token' ? variant : `${variant}-${normalizedRole}`;
+	                boardAssets[boardId].tokens[tokenKey] = urlPath;
+	              }
 
-              emitProgress(progressChannel, 'piece', {
-                packId,
-                role: p.role,
-                variant,
-                url: urlPath,
-                status: finalStatus,
-                reused: true,
-                resumePackId: resumePackIdClean,
-                prompt: promptForModel,
-              });
+              emitProgressWithGame(
+                progressChannelResolved,
+                'piece',
+                {
+                  packId,
+                  boardId,
+                  role: p.role,
+                  variant,
+                  url: urlPath,
+                  status: finalStatus,
+                  reused: true,
+                  resumePackId: resumePackIdClean,
+                  prompt: promptForModel,
+                },
+                gameId,
+              );
               if (gameId) {
-                updateJobPieceState(gameId, normalizedRole, variant, {
+                updateJobPieceState(gameId, boardId, normalizedRole, variant, {
                   status: finalStatus,
                   url: urlPath,
                   reused: true,
                   prompt: promptForModel,
                 });
+                markJobState(gameId, {
+                  boardAssets: JSON.parse(JSON.stringify(boardAssets)),
+                  activePiece: null,
+                });
               }
               await writeManifestPartial(false);
               log('reused existing asset', { packId, role: p.role, variant, resumePackId: resumePackIdClean });
-              remainingPieces -= 1;
-              const continueAfterReuse = await awaitAdvanceIfNeeded();
-              if (!continueAfterReuse) {
-                break;
-              }
+              await maybeWaitForClient({ boardId, role: p.role, variant });
               continue;
             } catch (reuseErr) {
               if (reuseErr?.code !== 'ENOENT') {
@@ -1309,14 +1663,25 @@ router.post('/', async (req, res) => {
                 break;
               }
               log('photo sprite generation failed', err?.message || err);
-              emitProgress(progressChannel, 'piece-error', { packId, role: p.role, variant, error: err?.message || err });
+              emitProgressWithGame(
+                progressChannelResolved,
+                'piece-error',
+                { packId, boardId, role: p.role, variant, error: err?.message || err },
+                gameId,
+              );
               throw new Error(`Photoreal generation failed for ${p.role}/${variant}: ${err?.message || err}`);
             }
             if (!svg) {
               log('photo sprite generation returned empty', { role: p.role, variant });
-              emitProgress(progressChannel, 'piece-error', { packId, role: p.role, variant, error: `Photoreal generation failed for ${p.role}/${variant}` });
+              emitProgressWithGame(
+                progressChannelResolved,
+                'piece-error',
+                { packId, boardId, role: p.role, variant, error: `Photoreal generation failed for ${p.role}/${variant}` },
+                gameId,
+              );
               if (gameId) {
-                updateJobPieceState(gameId, normalizedRole, variant, { status: 'error' });
+                updateJobPieceState(gameId, boardId, normalizedRole, variant, { status: 'error' });
+                markJobState(gameId, { activePiece: null });
               }
               throw new Error(`Photoreal generation failed for ${p.role}/${variant}`);
             }
@@ -1441,14 +1806,15 @@ router.post('/', async (req, res) => {
           if (cancelled) break;
 
           if (!svg) {
-            emitProgress(progressChannel, 'piece-error', { packId, role: p.role, variant, error: `generation failed for ${p.role}/${variant}` });
+            emitProgressWithGame(
+              progressChannelResolved,
+              'piece-error',
+              { packId, boardId, role: p.role, variant, error: `generation failed for ${p.role}/${variant}` },
+              gameId,
+            );
             if (gameId) {
-              updateJobPieceState(gameId, normalizedRole, variant, { status: 'error' });
-            }
-            remainingPieces -= 1;
-            const continueAfterMissing = await awaitAdvanceIfNeeded();
-            if (!continueAfterMissing) {
-              break;
+              updateJobPieceState(gameId, boardId, normalizedRole, variant, { status: 'error' });
+              markJobState(gameId, { activePiece: null });
             }
             continue;
           }
@@ -1466,66 +1832,64 @@ router.post('/', async (req, res) => {
             variant: variant === 'main' ? null : variant,
           });
           
-          boardAssets[boardId] ||= {};
-          if (isCover) {
-            boardAssets[boardId].cover = urlPath;
-          } else {
-            boardAssets[boardId].tokens ||= {};
-            boardAssets[boardId].tokens[variant] = urlPath;
-          }
+	          boardAssets[boardId] ||= {};
+	          if (isCover) {
+	            boardAssets[boardId].cover = urlPath;
+	          } else {
+	            boardAssets[boardId].tokens ||= {};
+	            const tokenKey = normalizedRole === 'token' ? variant : `${variant}-${normalizedRole}`;
+	            boardAssets[boardId].tokens[tokenKey] = urlPath;
+	          }
 
-          emitProgress(progressChannel, 'piece', {
-            packId,
-            role: p.role,
-            variant,
-            url: urlPath,
-            status: finalStatus,
-            prompt: promptForModel,
-            vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
-            vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
-            openai: renderStyle === 'vector' ? willUseOpenAI : null,
-            openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
-            openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
-          });
+          emitProgressWithGame(
+            progressChannelResolved,
+            'piece',
+            {
+              packId,
+              boardId,
+              role: p.role,
+              variant,
+              url: urlPath,
+              status: finalStatus,
+              prompt: promptForModel,
+              vectorProvider: renderStyle === 'vector' ? effectiveVectorProvider : null,
+              vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+              openai: renderStyle === 'vector' ? willUseOpenAI : null,
+              openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+              openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
+            },
+            gameId,
+          );
 
           if (gameId) {
-            updateJobPieceState(gameId, normalizedRole, variant, {
+            updateJobPieceState(gameId, boardId, normalizedRole, variant, {
               status: finalStatus,
               url: urlPath,
               prompt: promptForModel,
             });
-          }
-
-          if (gameId) {
-            updateJobPieceState(gameId, normalizedRole, variant, {
-              status: finalStatus,
-              url: urlPath,
-              prompt: promptForModel,
+            markJobState(gameId, {
+              boardAssets: JSON.parse(JSON.stringify(boardAssets)),
+              activePiece: null,
             });
           }
 
           await writeManifestPartial(false);
-          remainingPieces -= 1;
-          const shouldContinue = await awaitAdvanceIfNeeded();
-          if (!shouldContinue) {
-            break;
-          }
+          await maybeWaitForClient({ boardId, role: p.role, variant });
         }
       }
     }
     // end board asset generation
     }
 
-    if (typeof req.off === 'function') {
-      req.off('aborted', abortHandler);
-      req.off('close', abortHandler);
-    } else {
-      req.removeListener('aborted', abortHandler);
-      req.removeListener('close', abortHandler);
-    }
     upstreamAbortController.signal.removeEventListener('abort', onControllerAbort);
 
     if (cancelled) {
+      // Stop periodic state broadcasts on cancellation
+      if (stateBroadcastTimer) {
+        clearInterval(stateBroadcastTimer);
+        stateBroadcastTimer = null;
+      }
+
       if (gameId) {
         markJobStateCancelled(gameId);
       }
@@ -1550,28 +1914,60 @@ router.post('/', async (req, res) => {
       return count + (board.tokens ? Object.keys(board.tokens).length : 0);
     }, 0);
     
-    log('pack ready', { packId, pieces: totalPieces, boards: Object.keys(boardAssets).length });
+    const totalCovers = Object.values(boardAssets).reduce(
+      (count, board) => count + (board.cover ? 1 : 0),
+      0,
+    );
+    const totalBoardFiles = Object.values(boardAssets).reduce((count, board) => {
+      return (
+        count +
+        (board.boardPreview ? 1 : 0) +
+        (board.background ? 1 : 0) +
+        (board.tileLight ? 1 : 0) +
+        (board.tileDark ? 1 : 0)
+      );
+    }, 0);
+
+    log('pack ready', {
+      packId,
+      boards: Object.keys(boardAssets).length,
+      tokenVariants: totalPieces,
+      covers: totalCovers,
+      boardFiles: totalBoardFiles,
+      totalAssets: totalPieces + totalCovers + totalBoardFiles,
+    });
+    // Stop periodic state broadcasts now that generation is complete
+    if (stateBroadcastTimer) {
+      clearInterval(stateBroadcastTimer);
+      stateBroadcastTimer = null;
+    }
+
     const stateSnapshot = gameId ? jobStates.get(String(gameId)) : null;
     const promptSnapshot = collectJobPrompts(stateSnapshot);
-    emitProgress(progressChannel, 'complete', {
-      packId,
-      baseUrl: `/skins/${packId}/`,
-      manifestUrl: `/skins/${packId}/manifest.json`,
-      boardAssets: sortBoardAssets(boardAssets),
-      renderStyle,
-      vectorProvider: renderStyle === 'vector' ? vectorProvider : null,
-      vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
-      openai: renderStyle === 'vector' ? willUseOpenAI : null,
-      openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
-      openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
-      prompts: promptSnapshot,
-    });
-    closeChannel(progressChannel);
+    emitProgressWithGame(
+      progressChannelResolved,
+      'complete',
+      {
+        packId,
+        baseUrl: `/skins/${packId}/`,
+        manifestUrl: `/skins/${packId}/manifest.json`,
+        boardAssets: sortBoardAssets(boardAssets),
+        renderStyle,
+        vectorProvider: renderStyle === 'vector' ? effectiveVectorProvider : null,
+        vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
+        openai: renderStyle === 'vector' ? willUseOpenAI : null,
+        openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
+        openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
+        prompts: promptSnapshot,
+      },
+      gameId,
+    );
+    closeChannel(progressChannelResolved);
     if (gameId && upstreamAbortController) {
       clearPendingJob(gameId, upstreamAbortController);
     }
     if (gameId) {
-      markJobState(gameId, { active: false });
+      markJobState(gameId, { active: false, progressChannel: null, activePiece: null });
       // Auto-cleanup old packs: keep 2 most recent per game
       cleanupOldPacksForGame(gameId, packsDir, 2).catch(err => 
         log('cleanup after generation failed', { gameId, err: err?.message || err })
@@ -1587,23 +1983,30 @@ router.post('/', async (req, res) => {
       renderStyle,
     });
   } catch (err) {
+    // Stop periodic state broadcasts on error
+    if (stateBroadcastTimer) {
+      clearInterval(stateBroadcastTimer);
+      stateBroadcastTimer = null;
+    }
+
     log('pack creation failed', { packId, error: err?.message || err });
     if (gameId) {
-      markJobState(gameId, { active: false });
+      markJobState(gameId, { active: false, progressChannel: null, activePiece: null });
     }
-    emitProgress(progressChannel, 'error', {
-      packId,
-      error: err?.message || err,
-    });
-    closeChannel(progressChannel);
+    emitProgressWithGame(
+      progressChannelResolved,
+      'error',
+      {
+        packId,
+        error: err?.message || err,
+      },
+      gameId,
+    );
+    closeChannel(progressChannelResolved);
     if (gameId && upstreamAbortController) {
       clearPendingJob(gameId, upstreamAbortController);
     }
     res.status(500).json({ ok: false, error: err.message });
-  } finally {
-    if (gateChannel) {
-      cleanupAdvanceGate(gateChannel);
-    }
   }
 });
 
@@ -1647,15 +2050,23 @@ router.delete('/for-game/:gameId', async (req, res) => {
     const items = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
     const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
     
-    // All packs are game-agnostic by name (pack_<timestamp>_<nanoId>)
-    // So we delete ALL packs when game is deleted (they're temporary artifacts).
-    // If you want gameId-specific cleanup, extract gameId from metadata or track it separately.
+    const normalizeGameId = (value) => String(value || '').trim();
+    const targetGameId = normalizeGameId(gameId);
+    if (!targetGameId) {
+      return res.status(400).json({ ok: false, error: 'gameId required' });
+    }
+
     const deleted = [];
     const failed = [];
     
     for (const packName of allPacks) {
       const packPath = path.join(packsDir, packName);
       try {
+        const meta = await readPackMeta(packPath);
+        const metaGameId = normalizeGameId(meta?.gameId);
+        if (!metaGameId || metaGameId !== targetGameId) {
+          continue;
+        }
         await fs.rm(packPath, { recursive: true, force: true });
         deleted.push(packName);
         log('deleted pack for game cleanup', { gameId, packId: packName });

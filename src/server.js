@@ -1,5 +1,7 @@
 // service-assets/src/server.js
 import express from 'express';
+import http from 'http';
+import { Server as SocketIOServer } from 'socket.io';
 import cors from 'cors';
 import morgan from 'morgan';
 import path from 'path';
@@ -7,6 +9,8 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'crypto';
 import packsRouter from './routes/packs.js';
+import { setProgressSocketServer } from './services/progressHub.js';
+import { registerProgressSocket } from './services/progressSocket.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,7 +46,26 @@ app.set('packsDir', PACKS_DIR);
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '5mb' }));
-app.use(morgan('dev'));
+const HTTP_LOG_MODE = (process.env.ASSETS_HTTP_LOG_MODE || 'reduced').toLowerCase();
+app.use(
+  morgan('dev', {
+    skip: (req) => {
+      if (HTTP_LOG_MODE === 'full') return false;
+      const url = String(req?.originalUrl || req?.url || '');
+      if (!url) return false;
+      // Avoid noisy polling + static asset fetches (enable with ASSETS_HTTP_LOG_MODE=full)
+      if (url === '/health' || url === '/api/skins/health') return true;
+      if (url.startsWith('/api/skins/packs/state/')) return true;
+      if (url.startsWith('/api/skins/packs/jobs/status/')) return true;
+      if (url.startsWith('/api/skins/packs/progress/')) return true;
+      const method = String(req?.method || '').toUpperCase();
+      if ((method === 'GET' || method === 'HEAD') && (url.startsWith('/skins/') || url.startsWith('/avatars/'))) {
+        return true;
+      }
+      return false;
+    },
+  }),
+);
 
 // Serve generated packs as /skins/<packId>/...
 app.use('/skins', express.static(PACKS_DIR, { fallthrough: true }));
@@ -90,7 +113,17 @@ app.post('/api/avatars', express.json({ limit: '6mb' }), (req, res) => {
 // 404
 app.use((_req, res) => res.status(404).json({ ok: false, error: 'Not Found' }));
 
-app.listen(PORT, () => {
+const server = http.createServer(app);
+const io = new SocketIOServer(server, {
+  cors: { origin: '*' },
+  path: '/socket.io-assets',
+  pingInterval: 5000,
+  pingTimeout: 5000,
+});
+setProgressSocketServer(io);
+registerProgressSocket(io);
+
+server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`[assets] listening on :${PORT}, packs dir: ${PACKS_DIR}`);
 });
