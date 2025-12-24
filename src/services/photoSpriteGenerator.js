@@ -2,7 +2,6 @@
 // Generate photoreal sprites as PNG data URIs wrapped in SVG.
 
 const IMAGE_PROVIDER = (process.env.AI_IMAGE_PROVIDER || process.env.AI_SVG_PROVIDER || '').toLowerCase();
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.PLAYFACTORY_OPENAI_KEY;
 const OPENAI_IMAGE_MODEL = process.env.AI_IMAGE_MODEL || 'gpt-image-1';
 const OPENAI_IMAGE_URL =
   process.env.AI_IMAGE_ENDPOINT || 'https://api.openai.com/v1/images/generations';
@@ -12,9 +11,14 @@ const OPENAI_IMAGE_STYLE = process.env.AI_IMAGE_STYLE || '';
 const OPENAI_IMAGE_SIZE_OVERRIDE = process.env.AI_IMAGE_SIZE || '';
 const IMAGE_TIMEOUT = Number(process.env.AI_IMAGE_TIMEOUT_MS || 20000);
 
-const openAiEnabled = IMAGE_PROVIDER === 'openai' && !!OPENAI_API_KEY;
 const PROMPT_PREVIEW_LEN = 180;
 const SUPPORTED_SIZE_SET = new Set(['1024x1024', '1024x1536', '1536x1024', 'auto']);
+
+function resolveApiKey(apiKey) {
+  if (typeof apiKey !== 'string') return null;
+  const trimmed = apiKey.trim();
+  return trimmed ? trimmed : null;
+}
 
 function normalizeOpenAiSize(size) {
   if (OPENAI_IMAGE_SIZE_OVERRIDE && SUPPORTED_SIZE_SET.has(OPENAI_IMAGE_SIZE_OVERRIDE)) {
@@ -56,10 +60,11 @@ function buildImagePrompt({ prompt, role, variant, theme }) {
     .join(' ');
 }
 
-async function callOpenAIForImage({ prompt, size, signal }) {
-  if (!openAiEnabled) {
+async function callOpenAIForImage({ prompt, size, signal, apiKey }) {
+  const key = resolveApiKey(apiKey);
+  if (IMAGE_PROVIDER !== 'openai' || !key) {
     throw new Error(
-      'OpenAI image generation is disabled. Set AI_IMAGE_PROVIDER=openai and OPENAI_API_KEY.'
+      'OpenAI image generation is disabled. Provide an OpenAI API key in your profile.'
     );
   }
   const requestSize = normalizeOpenAiSize(size);
@@ -94,7 +99,7 @@ async function callOpenAIForImage({ prompt, size, signal }) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${key}`,
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -147,7 +152,7 @@ function wrapPngBase64AsSvg({ base64, size }) {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">\n  <image href="data:image/png;base64,${base64}" x="0" y="0" width="${size}" height="${size}" preserveAspectRatio="xMidYMid meet"/>\n</svg>`;
 }
 
-export async function generatePhotoSpriteSVG({ role, variant, prompt, size = 512, theme, signal }) {
+export async function generatePhotoSpriteSVG({ role, variant, prompt, size = 512, theme, signal, apiKey }) {
   const imagePrompt = buildImagePrompt({ prompt, role, variant, theme });
   const promptPreview = (imagePrompt || '').slice(0, PROMPT_PREVIEW_LEN);
   const apiSize = normalizeOpenAiSize(size);
@@ -164,7 +169,7 @@ export async function generatePhotoSpriteSVG({ role, variant, prompt, size = 512
       promptPreview,
     }),
   );
-  const base64 = await callOpenAIForImage({ prompt: imagePrompt, size: apiSize, signal });
+  const base64 = await callOpenAIForImage({ prompt: imagePrompt, size: apiSize, signal, apiKey });
   if (!base64) {
     throw new Error(`OpenAI image call returned empty payload (prompt preview: "${promptPreview}")`);
   }

@@ -376,6 +376,9 @@ const createSchema = Joi.object({
   gameName: Joi.string().allow('', null),
   stylePrompt: Joi.string().allow('', null),
   assetGenerationLocation: Joi.string().valid('local', 'remote').allow('', null),
+  openaiKey: Joi.string().allow('', null),
+  comfyuiUrl: Joi.string().allow('', null),
+  triposrUrl: Joi.string().allow('', null),
   renderStyle: Joi.string().valid('vector', 'photoreal').default('vector'),
   progressChannel: Joi.string().allow('', null),
   theme: Joi.object({
@@ -679,6 +682,9 @@ router.post('/', async (req, res) => {
     gameName = null,
     stylePrompt = '',
     assetGenerationLocation = null,
+    openaiKey = null,
+    comfyuiUrl = null,
+    triposrUrl = null,
     progressChannel = null,
     renderStyle = 'vector',
     theme,
@@ -697,6 +703,10 @@ router.post('/', async (req, res) => {
     typeof assetGenerationLocation === 'string' && assetGenerationLocation.trim()
       ? assetGenerationLocation.trim().toLowerCase()
       : null;
+  const openAiKey =
+    typeof openaiKey === 'string' && openaiKey.trim()
+      ? openaiKey.trim()
+      : null;
   if (renderStyle === 'vector' && normalizedLocation === 'local') {
     effectiveVectorProvider = 'local';
   }
@@ -708,8 +718,8 @@ router.post('/', async (req, res) => {
     ? resumePackId.trim()
     : null;
   const providerPreference = renderStyle === 'vector' ? effectiveVectorProvider : 'auto';
-  const willUseOpenAI = renderStyle === 'vector' && isOpenAiSvgAvailable(providerPreference);
-  const openAiEnv = getOpenAiSvgEnv();
+  const willUseOpenAI = renderStyle === 'vector' && isOpenAiSvgAvailable(providerPreference, openAiKey);
+  const openAiEnv = getOpenAiSvgEnv(openAiKey);
   const progressChannelResolved =
     typeof progressChannel === 'string' && progressChannel.trim()
       ? progressChannel.trim()
@@ -727,9 +737,17 @@ router.post('/', async (req, res) => {
   const allowReuseExisting = Boolean(reuseExistingPack && resumeSourceDir);
   const allowReuseExistingPieces = Boolean(allowReuseExisting && reuseExistingPieces !== false);
 
-  if (renderStyle === 'vector' && effectiveVectorProvider === 'openai' && !isOpenAiSvgAvailable('openai')) {
-    const msg = 'OpenAI SVG generation requested but OPENAI_API_KEY is not configured on the assets service.';
+  if (renderStyle === 'vector' && effectiveVectorProvider === 'openai' && !isOpenAiSvgAvailable('openai', openAiKey)) {
+    const msg = 'OpenAI SVG generation requested but no OpenAI API key was provided.';
     log('openai svg unavailable', { gameId, reason: msg });
+    emitProgressWithGame(progressChannelResolved, 'error', { packId: null, error: msg }, gameId);
+    res.status(400).json({ ok: false, error: msg });
+    return;
+  }
+
+  if (renderStyle === 'photoreal' && !openAiKey) {
+    const msg = 'Photoreal generation requested but no OpenAI API key was provided.';
+    log('openai image unavailable', { gameId, reason: msg });
     emitProgressWithGame(progressChannelResolved, 'error', { packId: null, error: msg }, gameId);
     res.status(400).json({ ok: false, error: msg });
     return;
@@ -1633,14 +1651,15 @@ router.post('/', async (req, res) => {
                 size: pieceSize,
                 theme,
               });
-              svg = await generatePhotoSpriteSVG({
-                role: p.role,
-                variant,
-                prompt: promptForModel,
-                size: pieceSize,
-                theme,
-                signal: upstreamAbortController.signal,
-              });
+            svg = await generatePhotoSpriteSVG({
+              role: p.role,
+              variant,
+              prompt: promptForModel,
+              size: pieceSize,
+              theme,
+              signal: upstreamAbortController.signal,
+              apiKey: openAiKey,
+            });
               if (cancelled) {
                 log('photo sprite result discarded due to cancellation', { packId, role: p.role, variant });
                 break;
@@ -1705,6 +1724,7 @@ router.post('/', async (req, res) => {
                   theme,
                   signal: upstreamAbortController.signal,
                   providerPreference,
+                  apiKey: openAiKey,
                 });
               } else {
                 // Local provider: use template SVGs with variation (don't log as skipped, this IS the local generation)

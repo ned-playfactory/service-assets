@@ -2,7 +2,6 @@
 // Optional AI-backed SVG generation. Currently supports OpenAI Responses API.
 
 const PROVIDER = (process.env.AI_SVG_PROVIDER || '').toLowerCase();
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.PLAYFACTORY_OPENAI_KEY;
 const OPENAI_MODEL = process.env.AI_SVG_MODEL || 'gpt-4o-mini';
 const OPENAI_URL = process.env.AI_SVG_ENDPOINT || 'https://api.openai.com/v1/responses';
 const REQUEST_TIMEOUT = Number(process.env.AI_SVG_TIMEOUT_MS || 15000);
@@ -10,27 +9,35 @@ const OPENAI_TEMP = Number(process.env.AI_SVG_TEMP || 0.05);
 const OPENAI_SEED_RAW = process.env.AI_SVG_SEED;
 let seedWarningLogged = false;
 
-const openAiAvailable = !!OPENAI_API_KEY;
 let availabilityLogged = false;
 
-function shouldUseOpenAI(preference = 'auto') {
+function resolveApiKey(apiKey) {
+  if (typeof apiKey !== 'string') return null;
+  const trimmed = apiKey.trim();
+  return trimmed ? trimmed : null;
+}
+
+function shouldUseOpenAI(preference = 'auto', apiKey = null) {
+  const key = resolveApiKey(apiKey);
+  if (!key) return false;
   const pref = String(preference || 'auto').toLowerCase();
   if (pref === 'local') return false;
-  if (pref === 'openai') return openAiAvailable;
+  if (pref === 'openai') return true;
   // auto → follow env
-  return PROVIDER === 'openai' && openAiAvailable;
+  return PROVIDER === 'openai';
 }
 
-export function isOpenAiSvgAvailable(preference = 'auto') {
-  return shouldUseOpenAI(preference);
+export function isOpenAiSvgAvailable(preference = 'auto', apiKey = null) {
+  return shouldUseOpenAI(preference, apiKey);
 }
 
-export function getOpenAiSvgEnv() {
+export function getOpenAiSvgEnv(apiKey = null) {
+  const key = resolveApiKey(apiKey);
   return {
     envProvider: PROVIDER || 'unset',
-    openAiAvailable,
-    hasKey: Boolean(OPENAI_API_KEY),
-    keyLen: OPENAI_API_KEY ? OPENAI_API_KEY.length : 0,
+    openAiAvailable: Boolean(key),
+    hasKey: Boolean(key),
+    keyLen: key ? key.length : 0,
     model: OPENAI_MODEL,
   };
 }
@@ -59,8 +66,9 @@ function extractSvgFromResponse(data) {
   return text || null;
 }
 
-async function callOpenAI({ prompt, signal }) {
-  if (!openAiAvailable) return null;
+async function callOpenAI({ prompt, signal, apiKey }) {
+  const key = resolveApiKey(apiKey);
+  if (!key) return null;
   const body = {
     model: OPENAI_MODEL,
     input: prompt,
@@ -90,7 +98,7 @@ async function callOpenAI({ prompt, signal }) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${key}`,
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -127,25 +135,26 @@ export async function generateAISVG({
   theme,
   signal,
   providerPreference = 'auto',
+  apiKey = null,
 }) {
   if (!role) return null;
-  const useOpenAI = shouldUseOpenAI(providerPreference);
+  const useOpenAI = shouldUseOpenAI(providerPreference, apiKey);
   if (!availabilityLogged) {
     availabilityLogged = true;
     console.log('[aiSvg] availability', {
       providerPreference,
       envProvider: PROVIDER || 'unset',
-      openAiAvailable,
+      openAiAvailable: Boolean(resolveApiKey(apiKey)),
       model: OPENAI_MODEL,
-      hasKey: Boolean(OPENAI_API_KEY && OPENAI_API_KEY.length),
+      hasKey: Boolean(resolveApiKey(apiKey)),
     });
   }
   if (!useOpenAI) {
     console.warn('[aiSvg] skipping openai', {
       providerPreference,
       envProvider: PROVIDER || 'unset',
-      openAiAvailable,
-      hasKey: Boolean(OPENAI_API_KEY),
+      openAiAvailable: Boolean(resolveApiKey(apiKey)),
+      hasKey: Boolean(resolveApiKey(apiKey)),
     });
     return null;
   }
@@ -171,7 +180,7 @@ Requirements:
 - Absolutely NO text, letters, or logos in the artwork.
 - Include depth cues (glow, shadow) to create a premium look.
 `;
-    return callOpenAI({ prompt: instructions, signal });
+    return callOpenAI({ prompt: instructions, signal, apiKey });
   }
   const ROLE_DESCRIPTIONS = {
     king: 'Regal crown with cross, tall column body, classic chess king silhouette.',
@@ -216,7 +225,7 @@ ${styleCuesLine}
 - Keep SVG simple and lightweight. Use only shapes/paths/gradients. No external images.
 `;
 
-  const svg = await callOpenAI({ prompt: instructions, signal });
+  const svg = await callOpenAI({ prompt: instructions, signal, apiKey });
   if (!svg) return null;
   return svg;
 }
