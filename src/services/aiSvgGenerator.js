@@ -51,6 +51,9 @@ function extractSvgFromResponse(data) {
       if (Array.isArray(content)) {
         content.forEach((c) => {
           if (typeof c?.text === 'string') candidates.push(c.text);
+          if (typeof c?.output_text === 'string') candidates.push(c.output_text);
+          if (typeof c?.content === 'string') candidates.push(c.content);
+          if (typeof c?.value === 'string') candidates.push(c.value);
         });
       } else if (typeof content === 'string') {
         candidates.push(content);
@@ -66,15 +69,51 @@ function extractSvgFromResponse(data) {
   return text || null;
 }
 
-async function callOpenAI({ prompt, signal, apiKey }) {
+function summarizeResponse(data) {
+  if (!data || typeof data !== 'object') return { hasData: false };
+  const output = Array.isArray(data.output) ? data.output : [];
+  const outputTypes = output.map((chunk) => chunk?.type).filter(Boolean);
+  const contentTypes = output
+    .flatMap((chunk) => (Array.isArray(chunk?.content) ? chunk.content : []))
+    .map((c) => c?.type)
+    .filter(Boolean);
+  const outputText =
+    typeof data.output_text === 'string'
+      ? data.output_text
+      : Array.isArray(data.output_text)
+        ? data.output_text.join('\n')
+        : '';
+  return {
+    hasData: true,
+    id: data.id || null,
+    model: data.model || null,
+    status: data.status || null,
+    incompleteDetails: data.incomplete_details || null,
+    outputCount: output.length,
+    outputTypes,
+    contentTypes,
+    outputTextLength: outputText.length,
+    outputTextPreview: outputText.slice(0, 400),
+    hasError: Boolean(data.error),
+    error: data.error || null,
+    usage: data.usage || null,
+  };
+}
+
+async function callOpenAI({ prompt, signal, apiKey, maxOutputTokens = 2048 }) {
   const key = resolveApiKey(apiKey);
   if (!key) return null;
   const body = {
     model: OPENAI_MODEL,
     input: prompt,
+    text: {
+      format: {
+        type: 'text',
+      },
+    },
     temperature: OPENAI_TEMP,
     top_p: 0.1,
-    max_output_tokens: 2048,
+    max_output_tokens: maxOutputTokens,
   };
 
   if (OPENAI_SEED_RAW && !seedWarningLogged) {
@@ -110,7 +149,11 @@ async function callOpenAI({ prompt, signal, apiKey }) {
       return null;
     }
     const data = await res.json();
-    return extractSvgFromResponse(data);
+    const svg = extractSvgFromResponse(data);
+    if (!svg) {
+      console.warn('[aiSvg] no svg found in response', summarizeResponse(data));
+    }
+    return svg;
   } catch (err) {
     if (err?.name === 'AbortError') {
       const reason = signal?.aborted ? 'aborted by caller' : 'timed out';
@@ -170,17 +213,85 @@ export async function generateAISVG({
     const instructions = `You are an SVG illustrator. Produce ONLY valid, standalone SVG markup (no fences, no explanations).
 Requirements:
 - Subject: cinematic board game box cover illustration.
-- Theme prompt: ${sanitizedPrompt}.
+- Theme prompt: ${sanitizedPrompt.slice(0, 800)}.
 - Composition: dynamic hero characters, environmental storytelling, dramatic lighting, subtle game board or iconography.
+- Include 3–5 distinct character silhouettes and 2–3 iconic props related to the theme; use foreground/midground/background depth.
 - ${paletteLine}
 - Ensure focal elements remain readable at thumbnail size.
 - Canvas: ${coverSize}px square viewBox 0 0 100 100.
 - Use layered gradients, shapes, and outlines; no external raster images.
-- Premium, polished finish: smooth curves, consistent stroke widths, soft shadows/glows, clean edges, no jagged artifacts.
+- Premium, polished finish: smooth curves, consistent stroke widths, soft shadows/glows, clean edges.
 - Absolutely NO text, letters, or logos in the artwork.
-- Include depth cues (glow, shadow) to create a premium look.
+- Always return a valid <svg> even if minimal (include a background rect and 3 layered shapes).
+- Output MUST start with "<svg" and end with "</svg>".
 `;
-    return callOpenAI({ prompt: instructions, signal, apiKey });
+    let svg = await callOpenAI({ prompt: instructions, signal, apiKey, maxOutputTokens: 4096 });
+    if (!svg) {
+      const minimal = `Return ONLY a valid <svg> (no fences, no explanations).
+Requirements:
+- Canvas: ${coverSize}px square viewBox 0 0 100 100.
+- A background rect + 3 layered abstract shapes.
+- Palette: ${theme?.p1Color || '#1e90ff'}, ${theme?.p2Color || '#ff3b30'}, accents ${theme?.accent || '#ffd60a'}.
+- No text or logos.`;
+      console.warn('[aiSvg] retrying cover with minimal prompt');
+      svg = await callOpenAI({ prompt: minimal, signal, apiKey, maxOutputTokens: 2048 });
+    }
+    return svg;
+  }
+  if (
+    normalizedRole === 'background' ||
+    normalizedRole === 'board' ||
+    normalizedRole === 'boardpreview' ||
+    normalizedRole === 'tilelight' ||
+    normalizedRole === 'tiledark'
+  ) {
+    const canvasSize = Number(size) || 1024;
+    const paletteLine = theme
+      ? `Palette: light ${theme.p1Color || '#e8e8e8'}, dark ${theme.p2Color || '#d8d8d8'}, accent ${theme.accent || '#ffd60a'}, outline ${theme.outline || '#202020'}.`
+      : '';
+    const basePrompt = sanitizedPrompt || 'custom board game';
+    const kind =
+      normalizedRole === 'background' || normalizedRole === 'board' || normalizedRole === 'boardpreview'
+        ? 'background'
+        : normalizedRole;
+    const kindLine =
+      kind === 'background'
+        ? 'Create a top-down board background texture (subtle, clean, not busy). No grid lines.'
+        : kind === 'tilelight'
+        ? 'Create a single light board tile texture. Top-down, square, subtle pattern.'
+        : 'Create a single dark board tile texture. Top-down, square, subtle pattern.';
+    const colorHint =
+      kind === 'tilelight'
+        ? `Use light color ${theme?.p1Color || '#e8e8e8'} as the base.`
+        : kind === 'tiledark'
+        ? `Use dark color ${theme?.p2Color || '#d8d8d8'} as the base.`
+        : '';
+    const instructions = `
+You are an SVG illustrator. Produce ONLY valid, standalone SVG markup (no fences, no explanations).
+Requirements:
+- Subject: board ${kind} artwork.
+- Theme prompt: ${basePrompt}.
+- ${kindLine}
+- ${paletteLine}
+- ${colorHint}
+- Keep edges clean; avoid heavy borders.
+- No text, letters, or logos.
+- Canvas: ${canvasSize}px square viewBox 0 0 100 100.
+- Use layered gradients, soft textures, subtle highlights.
+- No external images.
+`;
+    let svg = await callOpenAI({ prompt: instructions, signal, apiKey });
+    if (!svg) {
+      const minimal = `Return ONLY a valid <svg> (no fences, no explanations).
+Requirements:
+- Canvas: ${canvasSize}px square viewBox 0 0 100 100.
+- ${kindLine}
+- Palette: ${theme?.p1Color || '#e8e8e8'}, ${theme?.p2Color || '#d8d8d8'}, accent ${theme?.accent || '#ffd60a'}.
+- No text or logos.`;
+      console.warn('[aiSvg] retrying board asset with minimal prompt', { kind });
+      svg = await callOpenAI({ prompt: minimal, signal, apiKey });
+    }
+    return svg;
   }
   const ROLE_DESCRIPTIONS = {
     king: 'Regal crown with cross, tall column body, classic chess king silhouette.',
@@ -225,7 +336,16 @@ ${styleCuesLine}
 - Keep SVG simple and lightweight. Use only shapes/paths/gradients. No external images.
 `;
 
-  const svg = await callOpenAI({ prompt: instructions, signal, apiKey });
-  if (!svg) return null;
+  let svg = await callOpenAI({ prompt: instructions, signal, apiKey });
+  if (!svg) {
+    const minimal = `Return ONLY a valid <svg> (no fences, no explanations).
+Requirements:
+- Canvas: ${size || 512}px square viewBox 0 0 100 100.
+- Subject: ${canonical}
+- Palette: primary ${primaryColor}, secondary ${secondaryColor}, accent ${theme?.accent || '#ffd60a'}.
+- No text or logos.`;
+    console.warn('[aiSvg] retrying piece with minimal prompt', { role: normalizedRole, variant });
+    svg = await callOpenAI({ prompt: minimal, signal, apiKey });
+  }
   return svg;
 }

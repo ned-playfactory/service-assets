@@ -5,7 +5,7 @@ import fs from 'fs/promises';
 import { nanoid } from 'nanoid';
 import Joi from 'joi';
 import { generateAISVG, isOpenAiSvgAvailable, getOpenAiSvgEnv } from '../services/aiSvgGenerator.js';
-import { generatePhotoSpriteSVG } from '../services/photoSpriteGenerator.js';
+import { generatePhotoSpriteSVG, generatePhotoBoardSVG } from '../services/photoSpriteGenerator.js';
 import { sanitizePrompt } from '../lib/sanitizePrompt.js';
 import { renderChessPieceSVG, renderCoverSVG, renderTokenSVG, renderBackgroundSVG, renderTileSVG } from '../tri/svgTemplates.js';
 import {
@@ -340,10 +340,31 @@ function collectJobPrompts(state) {
   if (!state?.pieces) return prompts;
   Object.values(state.pieces).forEach((piece) => {
     if (!piece || !piece.prompt) return;
-    const key = `${piece.role}-${piece.variant}`;
+    const key =
+      typeof piece.id === 'string' && piece.id.trim()
+        ? piece.id.trim()
+        : `${piece.role}-${piece.variant}`;
     prompts[key] = piece.prompt;
   });
   return prompts;
+}
+
+function normalizePromptOverrides(source) {
+  const overrides = new Map();
+  if (!source || typeof source !== 'object') return overrides;
+  Object.entries(source).forEach(([rawKey, rawValue]) => {
+    if (typeof rawKey !== 'string' || typeof rawValue !== 'string') return;
+    const key = rawKey.trim().toLowerCase();
+    const value = rawValue.trim();
+    if (!key || !value) return;
+    overrides.set(key, value);
+  });
+  return overrides;
+}
+
+function promptKeyFromIdentifier(identifier) {
+  const id = formatIdentifier(identifier);
+  return typeof id === 'string' ? id.trim().toLowerCase() : '';
 }
 
 function buildPiecesState(piecesList = []) {
@@ -409,6 +430,7 @@ const createSchema = Joi.object({
     })
   ).default([]),
   targetBoardIds: Joi.array().items(Joi.string()).default([]), // Which boards to regenerate
+  targetIds: Joi.array().items(Joi.string()).default([]), // Specific asset identifiers to regenerate
   existingBoardAssets: Joi.object().pattern(
     Joi.string(),
     Joi.object({
@@ -425,6 +447,10 @@ const createSchema = Joi.object({
   reuseExistingPack: Joi.boolean().default(false),
   reuseExistingPieces: Joi.boolean().default(true),
   vectorProvider: Joi.string().valid('auto', 'openai', 'local').default('auto'),
+  piecePrompts: Joi.object().pattern(
+    Joi.string(),
+    Joi.string().allow('', null),
+  ).default({}),
 });
 
 export function validateCreatePackPayload(body) {
@@ -487,6 +513,28 @@ async function pathExists(targetPath) {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function findLatestPackForBoard(packsDir, boardId, excludePackId) {
+  try {
+    const entries = await fs.readdir(packsDir, { withFileTypes: true });
+    const candidates = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name;
+      if (!name.startsWith('pack_')) continue;
+      if (excludePackId && name === excludePackId) continue;
+      const boardPath = path.join(packsDir, name, boardId);
+      if (!(await pathExists(boardPath))) continue;
+      const stat = await fs.stat(path.join(packsDir, name));
+      candidates.push({ packId: name, mtime: stat.mtimeMs || 0 });
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.mtime - a.mtime);
+    return candidates[0].packId;
+  } catch {
+    return null;
   }
 }
 
@@ -691,12 +739,14 @@ router.post('/', async (req, res) => {
     pieces,
     boards,
     targetBoardIds,
+    targetIds,
     existingBoardAssets = {},
     size,
     resumePackId = null,
     reuseExistingPack = false,
     reuseExistingPieces = true,
     vectorProvider = 'auto',
+    piecePrompts = {},
   } = value;
   let effectiveVectorProvider = vectorProvider;
   const normalizedLocation =
@@ -713,6 +763,82 @@ router.post('/', async (req, res) => {
   const ownerUserId = sanitizeUserId(userId);
   const packsDir = req.app.get('packsDir');
   const mergedPrompt = [gameName, stylePrompt].map((s) => (s || '').trim()).filter(Boolean).join(' — ');
+  const promptOverrides = normalizePromptOverrides(piecePrompts);
+  const targetIdSet =
+    Array.isArray(targetIds) && targetIds.length
+      ? new Set(
+          targetIds
+            .map((id) => (typeof id === 'string' ? id.trim().toLowerCase() : ''))
+            .filter(Boolean),
+        )
+      : null;
+  const boardAssetRoles = new Set(['board', 'boardpreview', 'background', 'tilelight', 'tiledark']);
+  const parseBoardIdFromTargetId = (rawId) => {
+    const text = String(rawId || '').trim().toLowerCase();
+    if (!text) return null;
+    const parts = text.split('-');
+    if (parts.length < 3 || parts[1] !== 'board') return null;
+    const role = parts[0];
+    if (boardAssetRoles.has(role) || role === 'cover') {
+      return parts.slice(1).join('-');
+    }
+    if (parts.length <= 3) return null;
+    return parts.slice(1, -1).join('-');
+  };
+  const targetedBoardAssets = new Set();
+  if (targetIdSet) {
+    targetIdSet.forEach((id) => {
+      const parts = id.split('-');
+      const role = parts[0];
+      if (!boardAssetRoles.has(role)) return;
+      const boardId = parseBoardIdFromTargetId(id);
+      if (boardId) targetedBoardAssets.add(boardId);
+    });
+  }
+  const shouldGenerateBoardAssets = !targetIdSet || targetedBoardAssets.size > 0;
+  log('REQUEST TARGETS', {
+    packId: 'pending',
+    gameId,
+    targetIds,
+    targetIdSetSize: targetIdSet ? targetIdSet.size : 0,
+    targetedBoardAssets: Array.from(targetedBoardAssets),
+    shouldGenerateBoardAssets,
+  });
+  const resolvePiecePromptOverride = ({ role, boardId, variant }) => {
+    const key = promptKeyFromIdentifier({ role, boardId, variant });
+    return key ? promptOverrides.get(key) || null : null;
+  };
+  const resolveBoardPrompt = ({ role, boardId, name }) => {
+    const specificKey = promptKeyFromIdentifier({ role, boardId, variant: null });
+    const boardKey = promptKeyFromIdentifier({ role: 'board', boardId, variant: null });
+    const specificOverride = specificKey ? promptOverrides.get(specificKey) : null;
+    const boardOverride = boardKey ? promptOverrides.get(boardKey) : null;
+    const baseSegments = [gameName, stylePrompt, name].map((s) => (s || '').trim()).filter(Boolean);
+    const basePrompt = baseSegments.join(' — ') || mergedPrompt || 'custom board game';
+    const roleSuffixes = {
+      board:
+        'top-down board preview with clear grid lines, visible borders, readable squares, centered composition; must look different from the background texture',
+      background:
+        'seamless board background texture only; no grid lines, no borders, no tiles, subtle and not busy',
+      tilelight: 'single light tile texture, subtle shading, consistent scale, no grid lines',
+      tiledark: 'single dark tile texture, subtle shading, consistent scale, no grid lines',
+    };
+    const roleKey = String(role || '').toLowerCase();
+    const suffix = roleSuffixes[roleKey] || '';
+    const withSuffix = (text) => (suffix ? `${text} — ${suffix}` : text);
+    const chosen = specificOverride
+      ? withSuffix(specificOverride)
+      : boardOverride
+        ? withSuffix(boardOverride)
+        : withSuffix(basePrompt);
+    const { prompt: sanitized } = sanitizePrompt(chosen);
+    return sanitized || chosen;
+  };
+  log('PROMPT OVERRIDES SUMMARY', {
+    gameId,
+    overrideCount: promptOverrides.size,
+    overrideKeys: Array.from(promptOverrides.keys()).slice(0, 20),
+  });
   const pendingKey = gameId ? String(gameId) : null;
   const resumePackIdClean = resumePackId && typeof resumePackId === 'string'
     ? resumePackId.trim()
@@ -724,6 +850,18 @@ router.post('/', async (req, res) => {
     typeof progressChannel === 'string' && progressChannel.trim()
       ? progressChannel.trim()
       : nanoid(12);
+  if (renderStyle === 'vector' && normalizedLocation === 'remote' && !willUseOpenAI && gameId) {
+    emitProgressWithGame(
+      progressChannelResolved,
+      'notice',
+      {
+        type: 'openai-vector-disabled',
+        reason: openAiKey ? 'provider-unavailable' : 'missing-openai-key',
+        providerPreference,
+      },
+      gameId,
+    );
+  }
 
   let resumeSourceDir = null;
   if (resumePackIdClean) {
@@ -875,9 +1013,23 @@ router.post('/', async (req, res) => {
       ? boards.reduce((acc, b) => {
           const id = String(b?.id || '').trim();
           if (!id) return acc;
+          const rows =
+            Number(b?.rows || b?.Rows || b?.grid?.rows || b?.grid?.Rows || b?.Grid?.rows || b?.Grid?.Rows) ||
+            null;
+          const columns =
+            Number(
+              b?.columns ||
+                b?.Columns ||
+                b?.grid?.columns ||
+                b?.grid?.Columns ||
+                b?.Grid?.columns ||
+                b?.Grid?.Columns,
+            ) || null;
           acc[id] = {
             id,
             name: b?.name,
+            rows,
+            columns,
             background: b?.background || b?.backgroundImage || null,
             tileLight: b?.tileLight || null,
             tileDark: b?.tileDark || null,
@@ -941,6 +1093,16 @@ router.post('/', async (req, res) => {
     await writeManifestPartial(false);
 
     let boardIds = Object.keys(boardsMap).length ? Object.keys(boardsMap) : ['board-1'];
+    if (targetIdSet && targetIdSet.size) {
+      const targetedBoardsFromIds = new Set();
+      targetIdSet.forEach((id) => {
+        const boardId = parseBoardIdFromTargetId(id);
+        if (boardId) targetedBoardsFromIds.add(boardId);
+      });
+      if (targetedBoardsFromIds.size) {
+        boardIds = boardIds.filter((id) => targetedBoardsFromIds.has(String(id).toLowerCase()));
+      }
+    }
     
     log('BEFORE FILTERING', {
       packId,
@@ -1000,17 +1162,76 @@ router.post('/', async (req, res) => {
             return null;
           })();
           
+          if (!sourcePackId && resumePackIdClean) {
+            sourcePackId = resumePackIdClean;
+            log('fallback source pack to resume pack', {
+              packId,
+              boardId,
+              sourcePackId,
+            });
+          }
+
           if (!sourcePackId) {
             log('could not extract source pack for board', { packId, boardId, existing });
             continue;
           }
           
-          const sourcePath = path.join(packsDir, sourcePackId, boardId);
+          let sourcePath = path.join(packsDir, sourcePackId, boardId);
           const destPath = path.join(baseDir, boardId);
           
           try {
-            // Check if source exists
-            await fs.access(sourcePath);
+            // Check if source exists, fallback to resume pack if the extracted one was cleaned.
+            const sourceExists = await pathExists(sourcePath);
+            if (!sourceExists && resumePackIdClean && resumePackIdClean !== sourcePackId) {
+              const fallbackPath = path.join(packsDir, resumePackIdClean, boardId);
+              const fallbackExists = await pathExists(fallbackPath);
+              if (fallbackExists) {
+                log('fallback to resume pack for board copy', {
+                  packId,
+                  boardId,
+                  sourcePackId,
+                  fallbackPackId: resumePackIdClean,
+                });
+                sourcePackId = resumePackIdClean;
+                sourcePath = fallbackPath;
+              } else {
+                const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId);
+                if (latestPackId) {
+                  log('fallback to latest available pack for board copy', {
+                    packId,
+                    boardId,
+                    sourcePackId,
+                    fallbackPackId: resumePackIdClean,
+                    latestPackId,
+                  });
+                  sourcePackId = latestPackId;
+                  sourcePath = path.join(packsDir, latestPackId, boardId);
+                } else {
+                  log('no source board directory found', {
+                    packId,
+                    boardId,
+                    sourcePackId,
+                    fallbackPackId: resumePackIdClean,
+                  });
+                  continue;
+                }
+              }
+            } else if (!sourceExists) {
+              const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId);
+              if (latestPackId) {
+                log('fallback to latest available pack for board copy', {
+                  packId,
+                  boardId,
+                  sourcePackId,
+                  latestPackId,
+                });
+                sourcePackId = latestPackId;
+                sourcePath = path.join(packsDir, latestPackId, boardId);
+              } else {
+                log('no source board directory found', { packId, boardId, sourcePackId });
+                continue;
+              }
+            }
             
             // Copy the entire board directory
             await fs.cp(sourcePath, destPath, { recursive: true });
@@ -1097,8 +1318,25 @@ router.post('/', async (req, res) => {
           const destCover = path.join(baseDir, boardId, 'cover');
           const srcPieces = path.join(resumeSourceDir, boardId, 'pieces');
           const destPieces = path.join(baseDir, boardId, 'pieces');
-          const coverExists = await pathExists(srcCover);
-          const piecesExists = await pathExists(srcPieces);
+          const coverId = formatIdentifier({ role: 'cover', boardId, variant: null }).toLowerCase();
+          const isCoverTargeted = Boolean(targetIdSet && targetIdSet.has(coverId));
+          const hasTargetedPieceForBoard = Boolean(
+            targetIdSet &&
+              Array.from(targetIdSet).some((id) => {
+                if (!id || !id.includes(`-${boardId}-`)) return false;
+                return !(
+                  id.startsWith('cover-') ||
+                  id.startsWith('background-') ||
+                  id.startsWith('tilelight-') ||
+                  id.startsWith('tiledark-') ||
+                  id.startsWith('board-')
+                );
+              }),
+          );
+          const shouldCopyCover = !isCoverTargeted;
+          const shouldCopyPieces = !hasTargetedPieceForBoard;
+          const coverExists = shouldCopyCover && (await pathExists(srcCover));
+          const piecesExists = shouldCopyPieces && (await pathExists(srcPieces));
           if (coverExists) {
             await fs.mkdir(destCover, { recursive: true });
             await fs.cp(srcCover, destCover, { recursive: true });
@@ -1116,6 +1354,42 @@ router.post('/', async (req, res) => {
           });
         } catch (err) {
           log('REUSE EXISTING: failed to copy cover/pieces', {
+            packId,
+            boardId,
+            error: err?.message || err,
+          });
+        }
+      }
+    }
+
+    // If we are NOT regenerating board assets, still copy existing board art for targeted boards
+    // so cover/piece-only regenerations don't wipe board/tiles/preview files.
+    if (allowReuseExisting && resumeSourceDir && !shouldGenerateBoardAssets) {
+      for (const boardId of boardIds) {
+        try {
+          const srcBoard = path.join(resumeSourceDir, boardId, 'board');
+          const destBoard = path.join(baseDir, boardId, 'board');
+          const boardExists = await pathExists(srcBoard);
+          if (!boardExists) continue;
+          await fs.mkdir(destBoard, { recursive: true });
+          await fs.cp(srcBoard, destBoard, { recursive: true });
+          const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+          const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
+          const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
+          const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
+          boardAssets[boardId] ||= {};
+          boardAssets[boardId].boardPreview ||= boardPreviewRel;
+          boardAssets[boardId].background ||= bgRel;
+          boardAssets[boardId].tileLight ||= lightRel;
+          boardAssets[boardId].tileDark ||= darkRel;
+          boardsMap[boardId] ||= { id: boardId };
+          boardsMap[boardId].preview ||= boardPreviewRel;
+          boardsMap[boardId].background ||= bgRel;
+          boardsMap[boardId].tileLight ||= lightRel;
+          boardsMap[boardId].tileDark ||= darkRel;
+          log('REUSE EXISTING: copied board art for targeted board', { packId, boardId });
+        } catch (err) {
+          log('REUSE EXISTING: failed to copy board art', {
             packId,
             boardId,
             error: err?.message || err,
@@ -1146,19 +1420,24 @@ router.post('/', async (req, res) => {
       };
       const initialBoardAssets = {};
 
-      boardIds.forEach((bid) => {
-        ensureBoardBucket(initialBoardAssets, bid);
-        ['board', 'background', 'tileLight', 'tileDark'].forEach((role) => {
-          const id = formatIdentifier({ role, boardId: bid, variant: null });
-          initialPieces[id] = {
-            id,
-            role,
-            boardId: bid,
-            variant: null,
-            status: 'queued',
-          };
+      if (shouldGenerateBoardAssets) {
+        boardIds.forEach((bid) => {
+          ensureBoardBucket(initialBoardAssets, bid);
+          ['board', 'background', 'tileLight', 'tileDark'].forEach((role) => {
+            const id = formatIdentifier({ role, boardId: bid, variant: null });
+            const normalizedId = id.toLowerCase();
+            if (targetIdSet && !targetIdSet.has(normalizedId)) return;
+            initialPieces[id] = {
+              id,
+              role,
+              boardId: bid,
+              variant: null,
+              status: 'queued',
+              prompt: resolveBoardPrompt({ role, boardId: bid, name: boardsMap?.[bid]?.name }),
+            };
+          });
         });
-      });
+      }
 
       orderedPieces.forEach((p) => {
         const normalizedRole = String(p.role || '').toLowerCase();
@@ -1168,22 +1447,31 @@ router.post('/', async (req, res) => {
           ensureBoardBucket(initialBoardAssets, bid);
           for (const vRaw of variants) {
             const variant = String(isCover ? 'main' : vRaw || 'p1').toLowerCase();
+            const promptOverride = resolvePiecePromptOverride({
+              role: normalizedRole,
+              boardId: bid,
+              variant: variant === 'main' ? null : variant,
+            });
             const id = formatIdentifier({
               role: normalizedRole,
               boardId: bid,
               variant: variant === 'main' ? null : variant,
             });
-            initialPieces[id] = {
-              id,
-              role: normalizedRole,
-              boardId: bid,
-              variant,
-              status: 'queued',
-              prompt:
-                typeof p.prompt === 'string' && p.prompt.trim()
-                  ? p.prompt.trim()
-                  : null,
-            };
+            const normalizedId = id.toLowerCase();
+            if (!targetIdSet || targetIdSet.has(normalizedId)) {
+              initialPieces[id] = {
+                id,
+                role: normalizedRole,
+                boardId: bid,
+                variant,
+                status: 'queued',
+                prompt:
+                  promptOverride ||
+                  (typeof p.prompt === 'string' && p.prompt.trim()
+                    ? p.prompt.trim()
+                    : null),
+              };
+            }
 
             const bucket = ensureBoardBucket(initialBoardAssets, bid);
             if (isCover) continue;
@@ -1227,11 +1515,63 @@ router.post('/', async (req, res) => {
       totalPieceCount,
     });
 
-    // Generate simple procedural board assets (SVG) for boards (default at least one)
-      if (boardIds.length) {
+    // Generate board assets (SVG/OpenAI) for boards when requested.
+      if (boardIds.length && shouldGenerateBoardAssets) {
+        const applyBoardPreviewOverlay = (svg) => {
+          if (!svg || typeof svg !== 'string') return svg;
+          const viewBoxMatch = svg.match(/viewBox="0 0 ([0-9.]+) ([0-9.]+)"/i);
+          const vbW = viewBoxMatch ? Number(viewBoxMatch[1]) : 100;
+          const vbH = viewBoxMatch ? Number(viewBoxMatch[2]) : 100;
+          const insetX = vbW * 0.02;
+          const insetY = vbH * 0.02;
+          const borderW = vbW - insetX * 2;
+          const borderH = vbH - insetY * 2;
+          const radius = Math.min(vbW, vbH) * 0.06;
+          const overlay = [
+            `<rect x="0" y="0" width="${vbW}" height="${vbH}" fill="black" fill-opacity="0.04" />`,
+            `<rect x="${insetX}" y="${insetY}" width="${borderW}" height="${borderH}" rx="${radius}" ry="${radius}" fill="none" stroke="black" stroke-opacity="0.18" stroke-width="${Math.min(vbW, vbH) * 0.012}" />`,
+          ].join('');
+          if (svg.includes('</svg>')) {
+            return svg.replace('</svg>', `${overlay}</svg>`);
+          }
+          return svg;
+        };
+        const normalizeSvgToBoardSize = (svg, boardId) => {
+          if (!svg || typeof svg !== 'string') return svg;
+          const rows = Number(boardsMap?.[boardId]?.rows) || null;
+          const columns = Number(boardsMap?.[boardId]?.columns) || null;
+          if (!rows || !columns) return svg;
+          const targetW = columns * 128;
+          const targetH = rows * 128;
+          const viewBoxMatch = svg.match(/viewBox="0 0 ([0-9.]+) ([0-9.]+)"/i);
+          const sourceW = viewBoxMatch ? Number(viewBoxMatch[1]) : 100;
+          const sourceH = viewBoxMatch ? Number(viewBoxMatch[2]) : 100;
+          if (!sourceW || !sourceH) return svg;
+          if (sourceW === targetW && sourceH === targetH) return svg;
+          const innerMatch = svg.match(/<svg[^>]*>([\s\S]*?)<\/svg>/i);
+          const inner = innerMatch ? innerMatch[1] : svg;
+          const scaleX = targetW / sourceW;
+          const scaleY = targetH / sourceH;
+          return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${targetW} ${targetH}"><g transform="scale(${scaleX} ${scaleY})">${inner}</g></svg>`;
+        };
         const writeBoardAsset = async (boardId, name) => {
+          if (targetIdSet && targetedBoardAssets.size && !targetedBoardAssets.has(String(boardId).toLowerCase())) {
+            log('writeBoardAsset skipping board (not targeted)', { packId, boardId });
+            return;
+          }
+          const boardPreviewId = formatIdentifier({ role: 'board', boardId, variant: null }).toLowerCase();
+          const backgroundId = formatIdentifier({ role: 'background', boardId, variant: null }).toLowerCase();
+          const tileLightId = formatIdentifier({ role: 'tileLight', boardId, variant: null }).toLowerCase();
+          const tileDarkId = formatIdentifier({ role: 'tileDark', boardId, variant: null }).toLowerCase();
+          const wantsBoardPreview = !targetIdSet || targetIdSet.has(boardPreviewId);
+          const wantsBackground = !targetIdSet || targetIdSet.has(backgroundId);
+          const wantsTileLight = !targetIdSet || targetIdSet.has(tileLightId);
+          const wantsTileDark = !targetIdSet || targetIdSet.has(tileDarkId);
+          const hasTargetedBoardAssets =
+            targetIdSet && (wantsBoardPreview || wantsBackground || wantsTileLight || wantsTileDark);
           const boardPath = path.join(baseDir, boardId, 'board');
           await fs.mkdir(boardPath, { recursive: true });
+          let boardAssetMode = 'template';
           
           log('writeBoardAsset start', { 
             boardId, 
@@ -1241,8 +1581,10 @@ router.post('/', async (req, res) => {
           
           // CRITICAL: Always copy existing board assets when resumeSourceDir exists
           // This preserves board-1 assets when adding board-2
-          const shouldCopyExisting = resumeSourceDir;
-          const existingBoardPath = shouldCopyExisting ? path.join(resumeSourceDir, boardId, 'board') : null;
+          const shouldCopyExisting =
+            resumeSourceDir &&
+            !(Array.isArray(targetBoardIds) && targetBoardIds.length > 0);
+          let existingBoardPath = resumeSourceDir ? path.join(resumeSourceDir, boardId, 'board') : null;
           let copiedFromExisting = false;
           
           log('writeBoardAsset paths', {
@@ -1252,6 +1594,56 @@ router.post('/', async (req, res) => {
             existingBoardPath,
             newBoardPath: boardPath,
           });
+
+          if (existingBoardPath && !(await pathExists(existingBoardPath))) {
+            const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId);
+            if (latestPackId) {
+              existingBoardPath = path.join(packsDir, latestPackId, boardId, 'board');
+              log('writeBoardAsset fallback existingBoardPath', {
+                packId,
+                boardId,
+                latestPackId,
+                existingBoardPath,
+              });
+            }
+          }
+
+          if (hasTargetedBoardAssets && !existingBoardPath) {
+            const removed = [];
+            const currentAssets = boardAssets[boardId] || {};
+            const nextAssets = { ...currentAssets };
+            if (!wantsBoardPreview && nextAssets.boardPreview) {
+              delete nextAssets.boardPreview;
+              removed.push('boardPreview');
+            }
+            if (!wantsBackground && nextAssets.background) {
+              delete nextAssets.background;
+              removed.push('background');
+            }
+            if (!wantsTileLight && nextAssets.tileLight) {
+              delete nextAssets.tileLight;
+              removed.push('tileLight');
+            }
+            if (!wantsTileDark && nextAssets.tileDark) {
+              delete nextAssets.tileDark;
+              removed.push('tileDark');
+            }
+            if (removed.length) {
+              boardAssets[boardId] = nextAssets;
+            }
+            const currentMap = boardsMap[boardId] || {};
+            const nextMap = { ...currentMap };
+            if (!wantsBoardPreview && nextMap.preview) delete nextMap.preview;
+            if (!wantsBackground && nextMap.background) delete nextMap.background;
+            if (!wantsTileLight && nextMap.tileLight) delete nextMap.tileLight;
+            if (!wantsTileDark && nextMap.tileDark) delete nextMap.tileDark;
+            boardsMap[boardId] = nextMap;
+            log('writeBoardAsset pruned untargeted (no resume)', {
+              packId,
+              boardId,
+              removed,
+            });
+          }
           
           if (existingBoardPath) {
             try {
@@ -1320,6 +1712,7 @@ router.post('/', async (req, res) => {
                 };
                 
                 copiedFromExisting = true;
+                boardAssetMode = 'copied';
                 log('copied existing board assets', { packId, boardId, from: resumePackIdClean });
               } else {
                 log('writeBoardAsset skipping copy - not all files exist', {
@@ -1342,9 +1735,139 @@ router.post('/', async (req, res) => {
           } else {
             log('writeBoardAsset no existingBoardPath', { packId, boardId });
           }
+
+          if (existingBoardPath && hasTargetedBoardAssets) {
+            const copyIfPresent = async (sourcePath, destPath, label) => {
+              try {
+                const exists = await pathExists(sourcePath);
+                if (!exists) return false;
+                await fs.copyFile(sourcePath, destPath);
+                log('writeBoardAsset copied untargeted asset', { packId, boardId, label });
+                return true;
+              } catch (err) {
+                log('writeBoardAsset failed to copy untargeted asset', {
+                  packId,
+                  boardId,
+                  label,
+                  error: err?.message || err,
+                });
+                return false;
+              }
+            };
+
+            const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
+            const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
+            const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
+            const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+
+            if (!wantsBackground) {
+              const copied = await copyIfPresent(
+                path.join(existingBoardPath, 'background.svg'),
+                path.join(boardPath, 'background.svg'),
+                'background',
+              );
+              if (copied) {
+                boardAssets[boardId] = {
+                  ...(boardAssets[boardId] || {}),
+                  background: bgRel,
+                };
+                boardsMap[boardId] = {
+                  ...(boardsMap[boardId] || {}),
+                  id: boardId,
+                  name: name || boardsMap[boardId]?.name || boardId,
+                  background: bgRel,
+                };
+              } else {
+                if (boardAssets[boardId]?.background) {
+                  delete boardAssets[boardId].background;
+                }
+                if (boardsMap[boardId]?.background) {
+                  delete boardsMap[boardId].background;
+                }
+              }
+            }
+            if (!wantsTileLight) {
+              const copied = await copyIfPresent(
+                path.join(existingBoardPath, 'tileLight.svg'),
+                path.join(boardPath, 'tileLight.svg'),
+                'tileLight',
+              );
+              if (copied) {
+                boardAssets[boardId] = {
+                  ...(boardAssets[boardId] || {}),
+                  tileLight: lightRel,
+                };
+                boardsMap[boardId] = {
+                  ...(boardsMap[boardId] || {}),
+                  id: boardId,
+                  name: name || boardsMap[boardId]?.name || boardId,
+                  tileLight: lightRel,
+                };
+              } else {
+                if (boardAssets[boardId]?.tileLight) {
+                  delete boardAssets[boardId].tileLight;
+                }
+                if (boardsMap[boardId]?.tileLight) {
+                  delete boardsMap[boardId].tileLight;
+                }
+              }
+            }
+            if (!wantsTileDark) {
+              const copied = await copyIfPresent(
+                path.join(existingBoardPath, 'tileDark.svg'),
+                path.join(boardPath, 'tileDark.svg'),
+                'tileDark',
+              );
+              if (copied) {
+                boardAssets[boardId] = {
+                  ...(boardAssets[boardId] || {}),
+                  tileDark: darkRel,
+                };
+                boardsMap[boardId] = {
+                  ...(boardsMap[boardId] || {}),
+                  id: boardId,
+                  name: name || boardsMap[boardId]?.name || boardId,
+                  tileDark: darkRel,
+                };
+              } else {
+                if (boardAssets[boardId]?.tileDark) {
+                  delete boardAssets[boardId].tileDark;
+                }
+                if (boardsMap[boardId]?.tileDark) {
+                  delete boardsMap[boardId].tileDark;
+                }
+              }
+            }
+            if (!wantsBoardPreview) {
+              const copied = await copyIfPresent(
+                path.join(existingBoardPath, 'preview.svg'),
+                path.join(boardPath, 'preview.svg'),
+                'preview',
+              );
+              if (copied) {
+                boardAssets[boardId] = {
+                  ...(boardAssets[boardId] || {}),
+                  boardPreview: boardPreviewRel,
+                };
+                boardsMap[boardId] = {
+                  ...(boardsMap[boardId] || {}),
+                  id: boardId,
+                  name: name || boardsMap[boardId]?.name || boardId,
+                  preview: boardPreviewRel,
+                };
+              } else {
+                if (boardAssets[boardId]?.boardPreview) {
+                  delete boardAssets[boardId].boardPreview;
+                }
+                if (boardsMap[boardId]?.preview) {
+                  delete boardsMap[boardId].preview;
+                }
+              }
+            }
+          }
           
-          // Only generate if we didn't copy from existing
-          if (!copiedFromExisting) {
+          // Only generate if we didn't copy from existing, or if we explicitly targeted board assets.
+          if (!copiedFromExisting || hasTargetedBoardAssets) {
             log('writeBoardAsset generating new assets', { 
               packId, 
               boardId,
@@ -1355,42 +1878,248 @@ router.post('/', async (req, res) => {
             const dark = theme?.p2Color || '#d8d8d8';
             const accent = theme?.accent || '#ffd60a';
             const outline = theme?.outline || '#202020';
+
+            const backgroundPromptForModel = resolveBoardPrompt({
+              role: 'background',
+              boardId,
+              name,
+            });
+            const boardPreviewPromptForModel = resolveBoardPrompt({
+              role: 'board',
+              boardId,
+              name,
+            });
+            const tileLightPromptForModel = resolveBoardPrompt({
+              role: 'tileLight',
+              boardId,
+              name,
+            });
+            const tileDarkPromptForModel = resolveBoardPrompt({
+              role: 'tileDark',
+              boardId,
+              name,
+            });
+          const wantsPhotorealBoards =
+              renderStyle === 'photoreal' && normalizedLocation === 'remote' && openAiKey;
+            const wantsVectorBoards =
+              renderStyle === 'vector' && normalizedLocation === 'remote' && willUseOpenAI;
+            log('BOARD PROMPT RESOLVE', {
+              packId,
+              boardId,
+              wantsBoardPreview,
+              wantsBackground,
+              wantsTileLight,
+              wantsTileDark,
+              boardPreviewPromptPreview: String(boardPreviewPromptForModel || '').slice(0, 160),
+              backgroundPromptPreview: String(backgroundPromptForModel || '').slice(0, 160),
+              tileLightPromptPreview: String(tileLightPromptForModel || '').slice(0, 160),
+              tileDarkPromptPreview: String(tileDarkPromptForModel || '').slice(0, 160),
+            });
+
+            let backgroundSvg = null;
+            let previewSvg = null;
+            let tileLightSvg = null;
+            let tileDarkSvg = null;
+            if (wantsPhotorealBoards) {
+              try {
+                if (wantsBackground || wantsBoardPreview) {
+                  backgroundSvg = await generatePhotoBoardSVG({
+                    kind: 'background',
+                    prompt: backgroundPromptForModel,
+                    size: 1024,
+                    theme,
+                    signal: upstreamAbortController.signal,
+                    apiKey: openAiKey,
+                  });
+                  if (wantsBoardPreview) {
+                    previewSvg = backgroundSvg;
+                  }
+                }
+                if (wantsTileLight) {
+                  tileLightSvg = await generatePhotoBoardSVG({
+                    kind: 'tileLight',
+                    prompt: tileLightPromptForModel,
+                    size: 512,
+                    theme,
+                    signal: upstreamAbortController.signal,
+                    apiKey: openAiKey,
+                  });
+                }
+                if (wantsTileDark) {
+                  tileDarkSvg = await generatePhotoBoardSVG({
+                    kind: 'tileDark',
+                    prompt: tileDarkPromptForModel,
+                    size: 512,
+                    theme,
+                    signal: upstreamAbortController.signal,
+                    apiKey: openAiKey,
+                  });
+                }
+                boardAssetMode = 'openai-photoreal';
+              } catch (err) {
+                log('photo board generation failed, falling back', {
+                  packId,
+                  boardId,
+                  error: err?.message || err,
+                });
+              }
+            } else if (wantsVectorBoards) {
+              try {
+                if (wantsBackground || wantsBoardPreview) {
+                  backgroundSvg = await generateAISVG({
+                    role: 'background',
+                    variant: 'main',
+                    prompt: backgroundPromptForModel,
+                    size: 1024,
+                    theme,
+                    signal: upstreamAbortController.signal,
+                    providerPreference,
+                    apiKey: openAiKey,
+                  });
+                  if (wantsBoardPreview) {
+                    try {
+                      log('board preview ai request', {
+                        packId,
+                        boardId,
+                        promptPreview: String(boardPreviewPromptForModel || '').slice(0, 160),
+                        providerPreference,
+                      });
+                      previewSvg = await generateAISVG({
+                        role: 'board',
+                        variant: 'preview',
+                        prompt: boardPreviewPromptForModel,
+                        size: 1024,
+                        theme,
+                        signal: upstreamAbortController.signal,
+                        providerPreference,
+                        apiKey: openAiKey,
+                      });
+                      log('board preview ai success', {
+                        packId,
+                        boardId,
+                        length: previewSvg ? String(previewSvg).length : 0,
+                      });
+                    } catch (err) {
+                      log('board preview ai failed', {
+                        packId,
+                        boardId,
+                        error: err?.message || err,
+                      });
+                    }
+                  }
+                }
+                if (wantsTileLight) {
+                  tileLightSvg = await generateAISVG({
+                    role: 'tileLight',
+                    variant: 'light',
+                    prompt: tileLightPromptForModel,
+                    size: 512,
+                    theme,
+                    signal: upstreamAbortController.signal,
+                    providerPreference,
+                    apiKey: openAiKey,
+                  });
+                }
+                if (wantsTileDark) {
+                  tileDarkSvg = await generateAISVG({
+                    role: 'tileDark',
+                    variant: 'dark',
+                    prompt: tileDarkPromptForModel,
+                    size: 512,
+                    theme,
+                    signal: upstreamAbortController.signal,
+                    providerPreference,
+                    apiKey: openAiKey,
+                  });
+                }
+                boardAssetMode = 'openai-svg';
+              } catch (err) {
+                log('vector board ai generation failed, falling back', {
+                  packId,
+                  boardId,
+                  error: err?.message || err,
+                });
+              }
+            }
             
             // Generate with seeds for variation
             const bgSeed = `${gameId || ''}-${packId}-${boardId}-bg-${Date.now()}`;
             const lightSeed = `${gameId || ''}-${packId}-${boardId}-light-${Date.now()}`;
             const darkSeed = `${gameId || ''}-${packId}-${boardId}-dark-${Date.now()}`;
             
-            const backgroundSvg = renderBackgroundSVG({ light, dark, accent, outline, seed: bgSeed });
-            const tileLightSvg = renderTileSVG({ fill: light, accent, outline, isLight: true, seed: lightSeed });
-            const tileDarkSvg = renderTileSVG({ fill: dark, accent, outline, isLight: false, seed: darkSeed });
+            if ((wantsBackground || wantsBoardPreview) && !backgroundSvg) {
+              const rows = Number(boardsMap?.[boardId]?.rows) || null;
+              const columns = Number(boardsMap?.[boardId]?.columns) || null;
+              const width = columns ? columns * 128 : 1024;
+              const height = rows ? rows * 128 : 1024;
+              backgroundSvg = renderBackgroundSVG({
+                light,
+                dark,
+                accent,
+                outline,
+                seed: bgSeed,
+                width,
+                height,
+              });
+            }
+            if (wantsBoardPreview && !previewSvg) {
+              previewSvg = applyBoardPreviewOverlay(backgroundSvg);
+            }
+            backgroundSvg = normalizeSvgToBoardSize(backgroundSvg, boardId);
+            previewSvg = normalizeSvgToBoardSize(previewSvg, boardId);
+            if (wantsTileLight && !tileLightSvg) {
+              tileLightSvg = renderTileSVG({ fill: light, accent, outline, isLight: true, seed: lightSeed });
+            }
+            if (wantsTileDark && !tileDarkSvg) {
+              tileDarkSvg = renderTileSVG({ fill: dark, accent, outline, isLight: false, seed: darkSeed });
+            }
             
             const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
             const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
             const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
             const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
-            await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
-            await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
-            await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
-            await fs.writeFile(path.join(boardPath, 'preview.svg'), backgroundSvg, 'utf8');
+            if (wantsBackground && backgroundSvg) {
+              await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
+            }
+            if (wantsTileLight && tileLightSvg) {
+              await fs.writeFile(path.join(boardPath, 'tileLight.svg'), tileLightSvg, 'utf8');
+            }
+            if (wantsTileDark && tileDarkSvg) {
+              await fs.writeFile(path.join(boardPath, 'tileDark.svg'), tileDarkSvg, 'utf8');
+            }
+            if (wantsBoardPreview && (previewSvg || backgroundSvg)) {
+              await fs.writeFile(
+                path.join(boardPath, 'preview.svg'),
+                previewSvg || backgroundSvg,
+                'utf8',
+              );
+            }
             boardAssets[boardId] = {
               ...(boardAssets[boardId] || {}),
-              boardPreview: boardPreviewRel,
-              background: bgRel,
-              tileLight: lightRel,
-              tileDark: darkRel,
+              ...(wantsBoardPreview ? { boardPreview: boardPreviewRel } : {}),
+              ...(wantsBackground ? { background: bgRel } : {}),
+              ...(wantsTileLight ? { tileLight: lightRel } : {}),
+              ...(wantsTileDark ? { tileDark: darkRel } : {}),
             };
             boardsMap[boardId] = {
               ...(boardsMap[boardId] || {}),
               id: boardId,
               name: name || boardsMap[boardId]?.name || boardId,
-              background: bgRel,
-              tileLight: lightRel,
-              tileDark: darkRel,
-              preview: boardPreviewRel,
+              ...(wantsBackground ? { background: bgRel } : {}),
+              ...(wantsTileLight ? { tileLight: lightRel } : {}),
+              ...(wantsTileDark ? { tileDark: darkRel } : {}),
+              ...(wantsBoardPreview ? { preview: boardPreviewRel } : {}),
             };
             
             log('generated new board assets', { packId, boardId });
+          }
+          if (gameId) {
+            emitProgressWithGame(
+              progressChannelResolved,
+              'notice',
+              { type: 'board-assets', boardId, mode: boardAssetMode },
+              gameId,
+            );
           }
       };
 
@@ -1434,6 +2163,7 @@ router.post('/', async (req, res) => {
           }
         }
       }
+    }
 
       log('STARTING PIECES GENERATION', {
         packId,
@@ -1483,6 +2213,14 @@ router.post('/', async (req, res) => {
           if (cancelled) break;
           const isCover = isCoverRole;
           const variant = String(isCover ? 'main' : vRaw || 'p1').toLowerCase();
+          const pieceId = formatIdentifier({
+            role: normalizedRole,
+            boardId,
+            variant: variant === 'main' ? null : variant,
+          }).toLowerCase();
+          if (targetIdSet && !targetIdSet.has(pieceId)) {
+            continue;
+          }
           const color =
             variant === 'p1'
               ? theme.p1Color
@@ -1502,24 +2240,29 @@ router.post('/', async (req, res) => {
                 )
               : null;
           let svg = null;
+          const boardScopedOverride = resolvePiecePromptOverride({
+            role: normalizedRole,
+            boardId,
+            variant: variant === 'main' ? null : variant,
+          });
           const variantPromptOverride = resolveVariantPrompt(p.variantPrompts, variant);
-          const promptSegments = (variantPromptOverride ? [variantPromptOverride] : [mergedPrompt, p.prompt]).map((s) =>
-            (s || '').trim(),
-          );
+          const promptSegments = (
+            boardScopedOverride
+              ? [boardScopedOverride]
+              : variantPromptOverride
+              ? [variantPromptOverride]
+              : [mergedPrompt, p.prompt]
+          ).map((s) => (s || '').trim());
           const piecePrompt = promptSegments.filter(Boolean).join(' — ');
-          const promptForAI = piecePrompt || mergedPrompt || variantPromptOverride || '';
+          const promptForAI = piecePrompt || mergedPrompt || variantPromptOverride || boardScopedOverride || '';
           const { prompt: safePrompt, replacements } = sanitizePrompt(promptForAI);
-          const promptForModel = safePrompt || promptForAI;
+          const promptForModel = safePrompt || promptForAI || mergedPrompt || 'custom board game';
           const wantsPhotoreal = renderStyle === 'photoreal';
 
           if (gameId) {
             markJobState(gameId, {
               activePiece: {
-                id: formatIdentifier({
-                  role: normalizedRole,
-                  boardId,
-                  variant: variant === 'main' ? null : variant,
-                }),
+                id: pieceId,
                 role: normalizedRole,
                 boardId,
                 variant,
@@ -1639,15 +2382,12 @@ router.post('/', async (req, res) => {
           }
 
           if (wantsPhotoreal) {
-            if (!promptForModel) {
-              throw new Error(`Photoreal rendering requires a prompt for ${p.role}/${variant}`);
-            }
             try {
               log('photo sprite request', {
                 packId,
                 role: p.role,
                 variant,
-                promptPreview: promptForModel.slice(0, 160),
+                promptPreview: (promptForModel || '').slice(0, 160),
                 size: pieceSize,
                 theme,
               });
@@ -1705,12 +2445,11 @@ router.post('/', async (req, res) => {
               throw new Error(`Photoreal generation failed for ${p.role}/${variant}`);
             }
           } else {
-            if (promptForModel) {
               log('vector ai request', {
                 packId,
                 role: p.role,
                 variant,
-                promptPreview: promptForModel.slice(0, 160),
+                promptPreview: (promptForModel || '').slice(0, 160),
                 size: pieceSize,
                 providerPreference,
                 openai: willUseOpenAI,
@@ -1765,7 +2504,6 @@ router.post('/', async (req, res) => {
               if (svg) {
                 log('vector ai success', { packId, role: p.role, variant, length: svg.length });
               }
-            }
             if (upstreamAbortController.signal.aborted) {
               cancelled = true;
             }
@@ -1899,7 +2637,6 @@ router.post('/', async (req, res) => {
       }
     }
     // end board asset generation
-    }
 
     upstreamAbortController.signal.removeEventListener('abort', onControllerAbort);
 

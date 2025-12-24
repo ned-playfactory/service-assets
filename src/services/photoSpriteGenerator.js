@@ -60,6 +60,29 @@ function buildImagePrompt({ prompt, role, variant, theme }) {
     .join(' ');
 }
 
+function buildBoardImagePrompt({ prompt, kind, theme }) {
+  const base = prompt || 'custom board game';
+  const palette = theme
+    ? `Colors: light ${theme.p1Color || '#e8e8e8'}, dark ${theme.p2Color || '#d8d8d8'}, accent ${theme.accent || '#ffd60a'}.`
+    : '';
+  const kindLine =
+    kind === 'background'
+      ? 'Top-down board background texture, subtle and clean, no grid lines.'
+      : kind === 'tileLight'
+      ? 'Single square light board tile texture, top-down view.'
+      : 'Single square dark board tile texture, top-down view.';
+  return [
+    base,
+    kindLine,
+    'No text, letters, or logos. Clean edges. Subtle patterning.',
+    'Output should be a single PNG with alpha channel.',
+    palette,
+  ]
+    .map((s) => (s || '').trim())
+    .filter(Boolean)
+    .join(' ');
+}
+
 async function callOpenAIForImage({ prompt, size, signal, apiKey }) {
   const key = resolveApiKey(apiKey);
   if (IMAGE_PROVIDER !== 'openai' || !key) {
@@ -163,6 +186,36 @@ export async function generatePhotoSpriteSVG({ role, variant, prompt, size = 512
     JSON.stringify({
       role,
       variant,
+      size,
+      apiSize,
+      endpoint: OPENAI_IMAGE_URL,
+      promptPreview,
+    }),
+  );
+  const base64 = await callOpenAIForImage({ prompt: imagePrompt, size: apiSize, signal, apiKey });
+  if (!base64) {
+    throw new Error(`OpenAI image call returned empty payload (prompt preview: "${promptPreview}")`);
+  }
+  return wrapPngBase64AsSvg({ base64, size });
+}
+
+export async function generatePhotoBoardSVG({
+  kind = 'background',
+  prompt,
+  size = 1024,
+  theme,
+  signal,
+  apiKey,
+}) {
+  const imagePrompt = buildBoardImagePrompt({ prompt, kind, theme });
+  const promptPreview = (imagePrompt || '').slice(0, PROMPT_PREVIEW_LEN);
+  const apiSize = normalizeOpenAiSize(size);
+  console.log(
+    new Date().toISOString(),
+    '[photoSpriteGenerator]',
+    'request(board)',
+    JSON.stringify({
+      kind,
       size,
       apiSize,
       endpoint: OPENAI_IMAGE_URL,

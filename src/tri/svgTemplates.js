@@ -394,7 +394,13 @@ export function renderBackgroundSVG({
   accent = '#ffd60a',
   outline = '#202020',
   seed,
+  width = 1024,
+  height = 1024,
 } = {}) {
+  const w = Number(width) || 1024;
+  const h = Number(height) || 1024;
+  const sx = w / 1024;
+  const sy = h / 1024;
   let gradientAngle = { x1: 0, x2: 1, y1: 0, y2: 1 };
   let shapes = [];
   
@@ -416,9 +422,9 @@ export function renderBackgroundSVG({
     // Vary decorative shapes - 2-4 shapes at random positions
     const shapeCount = 2 + Math.floor(rand() * 3);
     for (let i = 0; i < shapeCount; i++) {
-      const x = 100 + rand() * 824;
-      const y = 100 + rand() * 824;
-      const size = 80 + rand() * 100;
+      const x = (100 + rand() * 824) * sx;
+      const y = (100 + rand() * 824) * sy;
+      const size = (80 + rand() * 100) * Math.min(sx, sy);
       const opacity = 0.08 + rand() * 0.08;
       const fillChoice = rand();
       const fill = fillChoice < 0.5 ? accent : outline;
@@ -438,13 +444,13 @@ export function renderBackgroundSVG({
   } else {
     // Default shapes
     shapes = [
-      `<circle cx="180" cy="180" r="120" fill="${accent}" opacity="0.12"/>`,
-      `<circle cx="860" cy="220" r="140" fill="${outline}" opacity="0.08"/>`,
-      `<rect x="260" y="520" width="520" height="320" rx="24" fill="${outline}" opacity="0.05"/>`,
+      `<circle cx="${(180 * sx).toFixed(0)}" cy="${(180 * sy).toFixed(0)}" r="${(120 * Math.min(sx, sy)).toFixed(0)}" fill="${accent}" opacity="0.12"/>`,
+      `<circle cx="${(860 * sx).toFixed(0)}" cy="${(220 * sy).toFixed(0)}" r="${(140 * Math.min(sx, sy)).toFixed(0)}" fill="${outline}" opacity="0.08"/>`,
+      `<rect x="${(260 * sx).toFixed(0)}" y="${(520 * sy).toFixed(0)}" width="${(520 * sx).toFixed(0)}" height="${(320 * sy).toFixed(0)}" rx="${(24 * Math.min(sx, sy)).toFixed(0)}" fill="${outline}" opacity="0.05"/>`,
     ];
   }
   
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs><linearGradient id="g" x1="${gradientAngle.x1}" x2="${gradientAngle.x2}" y1="${gradientAngle.y1}" y2="${gradientAngle.y2}"><stop offset="0%" stop-color="${light}" stop-opacity="0.85"/><stop offset="100%" stop-color="${dark}" stop-opacity="0.9"/></linearGradient></defs><rect width="1024" height="1024" fill="url(#g)"/>${shapes.join('')}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}"><defs><linearGradient id="g" x1="${gradientAngle.x1}" x2="${gradientAngle.x2}" y1="${gradientAngle.y1}" y2="${gradientAngle.y2}"><stop offset="0%" stop-color="${light}" stop-opacity="0.85"/><stop offset="100%" stop-color="${dark}" stop-opacity="0.9"/></linearGradient></defs><rect width="${w}" height="${h}" fill="url(#g)"/>${shapes.join('')}</svg>`;
 }
 
 export function renderTileSVG({
