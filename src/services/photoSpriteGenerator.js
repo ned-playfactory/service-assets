@@ -67,7 +67,9 @@ function buildBoardImagePrompt({ prompt, kind, theme }) {
     : '';
   const kindLine =
     kind === 'background'
-      ? 'Top-down board background texture, subtle and clean, no grid lines.'
+      ? 'Cinematic key art background scene: a large character/boss in the upper portion, with an environment behind them (stadium, mountains, grass, or theme-appropriate setting). Keep the lower area cleaner for gameplay. No grid, no tiles.'
+      : kind === 'boardPreview'
+      ? 'Top-down board surface with clear grid lines, readable squares, borders, and centered composition. Square board filling the frame (no extra margins), equal width/height.'
       : kind === 'tileLight'
       ? 'Single square light board tile texture, top-down view.'
       : 'Single square dark board tile texture, top-down view.';

@@ -876,9 +876,9 @@ router.post('/', async (req, res) => {
     const basePrompt = baseSegments.join(' — ') || mergedPrompt || 'custom board game';
     const roleSuffixes = {
       board:
-        'top-down board preview with clear grid lines, visible borders, readable squares, centered composition; must look different from the background texture',
+        'top-down board surface with clear grid lines, readable squares, and borders; centered composition; should be distinct from the scene background',
       background:
-        'seamless board background texture only; no grid lines, no borders, no tiles, subtle and not busy',
+        'cinematic key art background: large character/boss positioned in the upper portion, with a rich environment behind (stadium, mountains, grass, or theme-appropriate setting). Keep lower portion cleaner for the board; no grid or tiles',
       tilelight: 'single light tile texture, subtle shading, consistent scale, no grid lines',
       tiledark: 'single dark tile texture, subtle shading, consistent scale, no grid lines',
     };
@@ -2038,7 +2038,7 @@ router.post('/', async (req, res) => {
             let tileDarkSvg = null;
             if (wantsPhotorealBoards) {
               try {
-                if (wantsBackground || wantsBoardPreview) {
+                if (wantsBackground) {
                   backgroundSvg = await generatePhotoBoardSVG({
                     kind: 'background',
                     prompt: backgroundPromptForModel,
@@ -2048,9 +2048,17 @@ router.post('/', async (req, res) => {
                     apiKey: openAiKey,
                     renderDetail,
                   });
-                  if (wantsBoardPreview) {
-                    previewSvg = backgroundSvg;
-                  }
+                }
+                if (wantsBoardPreview) {
+                  previewSvg = await generatePhotoBoardSVG({
+                    kind: 'boardPreview',
+                    prompt: boardPreviewPromptForModel,
+                    size: 1024,
+                    theme,
+                    signal: upstreamAbortController.signal,
+                    apiKey: openAiKey,
+                    renderDetail,
+                  });
                 }
                 if (wantsTileLight) {
                   tileLightSvg = await generatePhotoBoardSVG({
