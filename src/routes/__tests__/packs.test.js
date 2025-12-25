@@ -107,6 +107,29 @@ test('Asset Pack Cleanup', async (suite) => {
     }
   });
 
+  await suite.test('Auto-cleanup: Preserve script-referenced packs', async () => {
+    const testPacksDir = await createTestPacksDir();
+    try {
+      const gameA = 'game-a';
+      const a1 = 'pack_1000_A1';
+      const a2 = 'pack_2000_A2';
+      const a3 = 'pack_3000_A3';
+
+      await createMockPack(testPacksDir, a1, { gameId: gameA, createdAt: 1000 });
+      await createMockPack(testPacksDir, a2, { gameId: gameA, createdAt: 2000 });
+      await createMockPack(testPacksDir, a3, { gameId: gameA, createdAt: 3000 });
+
+      // Keep only the newest by default, but preserve a1 explicitly.
+      await cleanupOldPacksForGame(gameA, testPacksDir, 1, [a1]);
+
+      assert.strictEqual(await packExists(testPacksDir, a3), true);
+      assert.strictEqual(await packExists(testPacksDir, a2), false);
+      assert.strictEqual(await packExists(testPacksDir, a1), true);
+    } finally {
+      await fs.rm(testPacksDir, { recursive: true, force: true });
+    }
+  });
+
   await suite.test('Auto-cleanup: Handle empty directory gracefully', async () => {
     const testPacksDir = await createTestPacksDir();
     try {

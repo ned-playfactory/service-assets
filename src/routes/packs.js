@@ -232,6 +232,7 @@ export function serializeJobState(state) {
   return {
     packId: state.packId || null,
     renderStyle: state.renderStyle || null,
+    renderDetail: state.renderDetail || null,
     baseUrl: state.baseUrl || null,
     manifestUrl: state.manifestUrl || null,
     progressChannel,
@@ -285,9 +286,14 @@ export async function writePackMeta(packDir, meta) {
   }
 }
 
-export async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2) {
+export async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2, keepPackIds = null) {
   if (!gameId) return;
   try {
+    const keepSet = new Set(
+      Array.isArray(keepPackIds) || keepPackIds instanceof Set
+        ? Array.from(keepPackIds || []).filter(Boolean)
+        : [],
+    );
     const items = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
     const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
     
@@ -317,10 +323,14 @@ export async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2) {
 
     gamePacksInfo.sort((a, b) => b.createdAt - a.createdAt);
     
-    // Keep the latest `keepLatest` packs, delete the rest
+    // Keep the latest `keepLatest` packs, delete the rest (except explicitly kept)
     if (gamePacksInfo.length > keepLatest) {
       const toDelete = gamePacksInfo.slice(keepLatest);
       for (const { name } of toDelete) {
+        if (keepSet.has(name)) {
+          log('auto-clean skip (script referenced)', { packId: name });
+          continue;
+        }
         const packPath = path.join(packsDir, name);
         try {
           await fs.rm(packPath, { recursive: true, force: true });
@@ -347,6 +357,30 @@ function collectJobPrompts(state) {
     prompts[key] = piece.prompt;
   });
   return prompts;
+}
+
+function extractPackIdsFromBoardAssets(boardAssets) {
+  const packIds = new Set();
+  if (!boardAssets || typeof boardAssets !== 'object') return packIds;
+  const collectFromValue = (value) => {
+    if (typeof value !== 'string') return;
+    const match = value.match(/\/skins\/(pack_[^/]+)\//i);
+    if (match && match[1]) {
+      packIds.add(match[1]);
+    }
+  };
+  Object.values(boardAssets).forEach((entry) => {
+    if (!entry || typeof entry !== 'object') return;
+    collectFromValue(entry.cover);
+    collectFromValue(entry.boardPreview);
+    collectFromValue(entry.background);
+    collectFromValue(entry.tileLight);
+    collectFromValue(entry.tileDark);
+    if (entry.tokens && typeof entry.tokens === 'object') {
+      Object.values(entry.tokens).forEach((url) => collectFromValue(url));
+    }
+  });
+  return packIds;
 }
 
 function normalizePromptOverrides(source) {
@@ -401,6 +435,7 @@ const createSchema = Joi.object({
   comfyuiUrl: Joi.string().allow('', null),
   triposrUrl: Joi.string().allow('', null),
   renderStyle: Joi.string().valid('vector', 'photoreal').default('vector'),
+  renderDetail: Joi.string().valid('low', 'medium', 'high').default('medium'),
   progressChannel: Joi.string().allow('', null),
   theme: Joi.object({
     p1Color: Joi.string().default('#1e90ff'),
@@ -735,6 +770,7 @@ router.post('/', async (req, res) => {
     triposrUrl = null,
     progressChannel = null,
     renderStyle = 'vector',
+    renderDetail = 'medium',
     theme,
     pieces,
     boards,
@@ -795,7 +831,9 @@ router.post('/', async (req, res) => {
       if (boardId) targetedBoardAssets.add(boardId);
     });
   }
-  const shouldGenerateBoardAssets = !targetIdSet || targetedBoardAssets.size > 0;
+  let shouldGenerateBoardAssets = !targetIdSet || targetedBoardAssets.size > 0;
+  const forcedBoardAssetBoards = new Set();
+  const preferScriptTruth = Boolean(gameId);
   log('REQUEST TARGETS', {
     packId: 'pending',
     gameId,
@@ -803,6 +841,7 @@ router.post('/', async (req, res) => {
     targetIdSetSize: targetIdSet ? targetIdSet.size : 0,
     targetedBoardAssets: Array.from(targetedBoardAssets),
     shouldGenerateBoardAssets,
+    preferScriptTruth,
   });
   const resolvePiecePromptOverride = ({ role, boardId, variant }) => {
     const key = promptKeyFromIdentifier({ role, boardId, variant });
@@ -982,7 +1021,7 @@ router.post('/', async (req, res) => {
 	      createdAt: Date.now(),
 	    });
 
-	    let boardAssets = {};  // Use 'let' to allow recreation if frozen
+    let boardAssets = {};  // Use 'let' to allow recreation if frozen
     const rewriteAssetUrl = (value) => {
       if (typeof value !== 'string') return value;
       return value.replace(/\/skins\/pack_[^/]+/g, `/skins/${packId}`);
@@ -1008,6 +1047,19 @@ router.post('/', async (req, res) => {
       });
       return out;
     };
+    if (
+      preferScriptTruth &&
+      (!boardAssets || Object.keys(boardAssets).length === 0) &&
+      existingBoardAssets &&
+      typeof existingBoardAssets === 'object'
+    ) {
+      boardAssets = JSON.parse(JSON.stringify(existingBoardAssets));
+      log('SCRIPT TRUTH: seeded boardAssets from existingBoardAssets', {
+        packId,
+        gameId,
+        seededBoards: Object.keys(boardAssets || {}),
+      });
+    }
     // legacy write helpers to keep old paths alive until frontend fully per-board
     const boardsMap = Array.isArray(boards)
       ? boards.reduce((acc, b) => {
@@ -1046,6 +1098,7 @@ router.post('/', async (req, res) => {
     });
     // Manifest writing disabled; keep placeholders for future reactivation.
     const writeManifestPartial = async () => {};
+    // Manifest files are not a source of truth; the script's assets block is.
     const orderedPieces = Array.isArray(pieces)
       ? pieces
           .filter(Boolean)
@@ -1125,7 +1178,7 @@ router.post('/', async (req, res) => {
       });
       
       // Copy non-targeted boards from their existing packs
-      if (existingBoardAssets && typeof existingBoardAssets === 'object') {
+      if (!preferScriptTruth && existingBoardAssets && typeof existingBoardAssets === 'object') {
         // Get ALL board IDs from existingBoardAssets, not just from boardsMap
         const allExistingBoardIds = Object.keys(existingBoardAssets);
         const nonTargetedBoards = allExistingBoardIds.filter(id => !targetSet.has(String(id).toLowerCase()));
@@ -1304,16 +1357,26 @@ router.post('/', async (req, res) => {
 
     if (allowReuseExisting && resumeSourceDir) {
       if (existingBoardAssets && typeof existingBoardAssets === 'object') {
-        boardAssets = rewriteBoardAssets(existingBoardAssets);
+        boardAssets = preferScriptTruth
+          ? JSON.parse(JSON.stringify(existingBoardAssets))
+          : rewriteBoardAssets(existingBoardAssets);
         log('REUSE EXISTING: seeded boardAssets from existingBoardAssets', {
           packId,
           gameId,
           boardIds,
           seededBoards: Object.keys(boardAssets || {}),
+          preferScriptTruth,
         });
       }
       for (const boardId of boardIds) {
         try {
+          if (preferScriptTruth) {
+            log('REUSE EXISTING: skipping cover/pieces copy (script truth mode)', {
+              packId,
+              boardId,
+            });
+            continue;
+          }
           const srcCover = path.join(resumeSourceDir, boardId, 'cover');
           const destCover = path.join(baseDir, boardId, 'cover');
           const srcPieces = path.join(resumeSourceDir, boardId, 'pieces');
@@ -1367,10 +1430,25 @@ router.post('/', async (req, res) => {
     if (allowReuseExisting && resumeSourceDir && !shouldGenerateBoardAssets) {
       for (const boardId of boardIds) {
         try {
+          if (preferScriptTruth) {
+            log('REUSE EXISTING: skipping board art copy (script truth mode)', {
+              packId,
+              boardId,
+            });
+            continue;
+          }
           const srcBoard = path.join(resumeSourceDir, boardId, 'board');
           const destBoard = path.join(baseDir, boardId, 'board');
           const boardExists = await pathExists(srcBoard);
-          if (!boardExists) continue;
+          if (!boardExists) {
+            forcedBoardAssetBoards.add(String(boardId).toLowerCase());
+            log('REUSE EXISTING: board art missing, forcing generation', {
+              packId,
+              boardId,
+              srcBoard,
+            });
+            continue;
+          }
           await fs.mkdir(destBoard, { recursive: true });
           await fs.cp(srcBoard, destBoard, { recursive: true });
           const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
@@ -1396,6 +1474,15 @@ router.post('/', async (req, res) => {
           });
         }
       }
+    }
+
+    if (forcedBoardAssetBoards.size > 0) {
+      shouldGenerateBoardAssets = true;
+      log('FORCING BOARD ASSET GENERATION', {
+        packId,
+        gameId,
+        forcedBoards: Array.from(forcedBoardAssetBoards),
+      });
     }
 
     // Seed server-side job state so refresh/resume can show current progress + already-written URLs.
@@ -1489,6 +1576,7 @@ router.post('/', async (req, res) => {
         ownerUserId,
         packId,
         renderStyle,
+        renderDetail,
         baseUrl: `/skins/${packId}`,
         manifestUrl: null,
         progressChannel: progressChannelResolved,
@@ -1559,16 +1647,18 @@ router.post('/', async (req, res) => {
             log('writeBoardAsset skipping board (not targeted)', { packId, boardId });
             return;
           }
-          const boardPreviewId = formatIdentifier({ role: 'board', boardId, variant: null }).toLowerCase();
-          const backgroundId = formatIdentifier({ role: 'background', boardId, variant: null }).toLowerCase();
-          const tileLightId = formatIdentifier({ role: 'tileLight', boardId, variant: null }).toLowerCase();
-          const tileDarkId = formatIdentifier({ role: 'tileDark', boardId, variant: null }).toLowerCase();
-          const wantsBoardPreview = !targetIdSet || targetIdSet.has(boardPreviewId);
-          const wantsBackground = !targetIdSet || targetIdSet.has(backgroundId);
-          const wantsTileLight = !targetIdSet || targetIdSet.has(tileLightId);
-          const wantsTileDark = !targetIdSet || targetIdSet.has(tileDarkId);
-          const hasTargetedBoardAssets =
-            targetIdSet && (wantsBoardPreview || wantsBackground || wantsTileLight || wantsTileDark);
+        const boardPreviewId = formatIdentifier({ role: 'board', boardId, variant: null }).toLowerCase();
+        const backgroundId = formatIdentifier({ role: 'background', boardId, variant: null }).toLowerCase();
+        const tileLightId = formatIdentifier({ role: 'tileLight', boardId, variant: null }).toLowerCase();
+        const tileDarkId = formatIdentifier({ role: 'tileDark', boardId, variant: null }).toLowerCase();
+        const forceBoardAssets = forcedBoardAssetBoards.has(String(boardId).toLowerCase());
+        const wantsBoardPreview = forceBoardAssets || !targetIdSet || targetIdSet.has(boardPreviewId);
+        const wantsBackground = forceBoardAssets || !targetIdSet || targetIdSet.has(backgroundId);
+        const wantsTileLight = forceBoardAssets || !targetIdSet || targetIdSet.has(tileLightId);
+        const wantsTileDark = forceBoardAssets || !targetIdSet || targetIdSet.has(tileDarkId);
+        const hasTargetedBoardAssets =
+          forceBoardAssets ||
+          (targetIdSet && (wantsBoardPreview || wantsBackground || wantsTileLight || wantsTileDark));
           const boardPath = path.join(baseDir, boardId, 'board');
           await fs.mkdir(boardPath, { recursive: true });
           let boardAssetMode = 'template';
@@ -1910,6 +2000,7 @@ router.post('/', async (req, res) => {
               wantsBackground,
               wantsTileLight,
               wantsTileDark,
+              renderDetail,
               boardPreviewPromptPreview: String(boardPreviewPromptForModel || '').slice(0, 160),
               backgroundPromptPreview: String(backgroundPromptForModel || '').slice(0, 160),
               tileLightPromptPreview: String(tileLightPromptForModel || '').slice(0, 160),
@@ -1930,6 +2021,7 @@ router.post('/', async (req, res) => {
                     theme,
                     signal: upstreamAbortController.signal,
                     apiKey: openAiKey,
+                    renderDetail,
                   });
                   if (wantsBoardPreview) {
                     previewSvg = backgroundSvg;
@@ -1943,6 +2035,7 @@ router.post('/', async (req, res) => {
                     theme,
                     signal: upstreamAbortController.signal,
                     apiKey: openAiKey,
+                    renderDetail,
                   });
                 }
                 if (wantsTileDark) {
@@ -1953,6 +2046,7 @@ router.post('/', async (req, res) => {
                     theme,
                     signal: upstreamAbortController.signal,
                     apiKey: openAiKey,
+                    renderDetail,
                   });
                 }
                 boardAssetMode = 'openai-photoreal';
@@ -2298,6 +2392,7 @@ router.post('/', async (req, res) => {
               openai: renderStyle === 'vector' ? willUseOpenAI : null,
               openAiAvailable: renderStyle === 'vector' ? openAiEnv.openAiAvailable : null,
               openAiHasKey: renderStyle === 'vector' ? openAiEnv.hasKey : null,
+              renderDetail: renderStyle === 'photoreal' ? renderDetail : null,
             },
             gameId,
           );
@@ -2307,6 +2402,7 @@ router.post('/', async (req, res) => {
             role: p.role,
             variant,
             renderStyle,
+            renderDetail,
             prompt: (promptForModel || '').slice(0, 160),
           });
 
@@ -2399,6 +2495,7 @@ router.post('/', async (req, res) => {
               theme,
               signal: upstreamAbortController.signal,
               apiKey: openAiKey,
+              renderDetail,
             });
               if (cancelled) {
                 log('photo sprite result discarded due to cancellation', { packId, role: p.role, variant });
@@ -2653,15 +2750,17 @@ router.post('/', async (req, res) => {
       clearPendingJob(gameId, upstreamAbortController);
       await writeManifestPartial(false);
       log('pack generation cancelled (partial assets preserved)', { packId, baseDir });
+      const finalManifestUrl = null;
       res.status(499).json({
         ok: false,
         cancelled: true,
         error: 'cancelled',
         packId,
         baseUrl: `/skins/${packId}/`,
-        manifestUrl: `/skins/${packId}/manifest.json`,
+        manifestUrl: finalManifestUrl,
         boardAssets: sortBoardAssets(boardAssets),
         renderStyle,
+        renderDetail,
       });
       return;
     }
@@ -2701,15 +2800,17 @@ router.post('/', async (req, res) => {
 
     const stateSnapshot = gameId ? jobStates.get(String(gameId)) : null;
     const promptSnapshot = collectJobPrompts(stateSnapshot);
+    const finalManifestUrl = null;
     emitProgressWithGame(
       progressChannelResolved,
       'complete',
       {
         packId,
         baseUrl: `/skins/${packId}/`,
-        manifestUrl: `/skins/${packId}/manifest.json`,
+        manifestUrl: finalManifestUrl,
         boardAssets: sortBoardAssets(boardAssets),
         renderStyle,
+        renderDetail,
         vectorProvider: renderStyle === 'vector' ? effectiveVectorProvider : null,
         vectorProviderResolved: renderStyle === 'vector' ? providerPreference : null,
         openai: renderStyle === 'vector' ? willUseOpenAI : null,
@@ -2724,9 +2825,16 @@ router.post('/', async (req, res) => {
       clearPendingJob(gameId, upstreamAbortController);
     }
     if (gameId) {
-      markJobState(gameId, { active: false, progressChannel: null, activePiece: null });
-      // Auto-cleanup old packs: keep 2 most recent per game
-      cleanupOldPacksForGame(gameId, packsDir, 2).catch(err => 
+      markJobState(gameId, {
+        active: false,
+        progressChannel: null,
+        activePiece: null,
+        manifestUrl: finalManifestUrl,
+      });
+      const referencedPackIds = extractPackIdsFromBoardAssets(existingBoardAssets);
+      referencedPackIds.add(packId);
+      // Auto-cleanup old packs: keep 2 most recent per game (plus script-referenced packs)
+      cleanupOldPacksForGame(gameId, packsDir, 2, referencedPackIds).catch(err => 
         log('cleanup after generation failed', { gameId, err: err?.message || err })
       );
     }
@@ -2735,9 +2843,10 @@ router.post('/', async (req, res) => {
       ok: true,
       packId,
       baseUrl: `/skins/${packId}/`,
-      manifestUrl: `/skins/${packId}/manifest.json`,
+      manifestUrl: finalManifestUrl,
       boardAssets: sortBoardAssets(boardAssets),
       renderStyle,
+      renderDetail,
     });
   } catch (err) {
     // Stop periodic state broadcasts on error

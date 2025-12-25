@@ -83,7 +83,13 @@ function buildBoardImagePrompt({ prompt, kind, theme }) {
     .join(' ');
 }
 
-async function callOpenAIForImage({ prompt, size, signal, apiKey }) {
+function resolveQuality(detail) {
+  const value = String(detail || '').toLowerCase();
+  if (value === 'low' || value === 'medium' || value === 'high') return value;
+  return null;
+}
+
+async function callOpenAIForImage({ prompt, size, signal, apiKey, quality }) {
   const key = resolveApiKey(apiKey);
   if (IMAGE_PROVIDER !== 'openai' || !key) {
     throw new Error(
@@ -99,7 +105,9 @@ async function callOpenAIForImage({ prompt, size, signal, apiKey }) {
   if (OPENAI_IMAGE_RESPONSE_FORMAT) {
     body.response_format = OPENAI_IMAGE_RESPONSE_FORMAT;
   }
-  if (OPENAI_IMAGE_QUALITY) {
+  if (quality) {
+    body.quality = quality;
+  } else if (OPENAI_IMAGE_QUALITY) {
     body.quality = OPENAI_IMAGE_QUALITY;
   }
   if (OPENAI_IMAGE_STYLE) {
@@ -175,10 +183,20 @@ function wrapPngBase64AsSvg({ base64, size }) {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">\n  <image href="data:image/png;base64,${base64}" x="0" y="0" width="${size}" height="${size}" preserveAspectRatio="xMidYMid meet"/>\n</svg>`;
 }
 
-export async function generatePhotoSpriteSVG({ role, variant, prompt, size = 512, theme, signal, apiKey }) {
+export async function generatePhotoSpriteSVG({
+  role,
+  variant,
+  prompt,
+  size = 512,
+  theme,
+  signal,
+  apiKey,
+  renderDetail,
+}) {
   const imagePrompt = buildImagePrompt({ prompt, role, variant, theme });
   const promptPreview = (imagePrompt || '').slice(0, PROMPT_PREVIEW_LEN);
   const apiSize = normalizeOpenAiSize(size);
+  const quality = resolveQuality(renderDetail);
   console.log(
     new Date().toISOString(),
     '[photoSpriteGenerator]',
@@ -188,11 +206,18 @@ export async function generatePhotoSpriteSVG({ role, variant, prompt, size = 512
       variant,
       size,
       apiSize,
+      renderDetail: quality || renderDetail || null,
       endpoint: OPENAI_IMAGE_URL,
       promptPreview,
     }),
   );
-  const base64 = await callOpenAIForImage({ prompt: imagePrompt, size: apiSize, signal, apiKey });
+  const base64 = await callOpenAIForImage({
+    prompt: imagePrompt,
+    size: apiSize,
+    signal,
+    apiKey,
+    quality,
+  });
   if (!base64) {
     throw new Error(`OpenAI image call returned empty payload (prompt preview: "${promptPreview}")`);
   }
@@ -206,10 +231,12 @@ export async function generatePhotoBoardSVG({
   theme,
   signal,
   apiKey,
+  renderDetail,
 }) {
   const imagePrompt = buildBoardImagePrompt({ prompt, kind, theme });
   const promptPreview = (imagePrompt || '').slice(0, PROMPT_PREVIEW_LEN);
   const apiSize = normalizeOpenAiSize(size);
+  const quality = resolveQuality(renderDetail);
   console.log(
     new Date().toISOString(),
     '[photoSpriteGenerator]',
@@ -218,11 +245,18 @@ export async function generatePhotoBoardSVG({
       kind,
       size,
       apiSize,
+      renderDetail: quality || renderDetail || null,
       endpoint: OPENAI_IMAGE_URL,
       promptPreview,
     }),
   );
-  const base64 = await callOpenAIForImage({ prompt: imagePrompt, size: apiSize, signal, apiKey });
+  const base64 = await callOpenAIForImage({
+    prompt: imagePrompt,
+    size: apiSize,
+    signal,
+    apiKey,
+    quality,
+  });
   if (!base64) {
     throw new Error(`OpenAI image call returned empty payload (prompt preview: "${promptPreview}")`);
   }
