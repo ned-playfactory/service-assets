@@ -294,12 +294,13 @@ export async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2, k
         ? Array.from(keepPackIds || []).filter(Boolean)
         : [],
     );
-    const items = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
-    const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
-    
     const normalizeGameId = (value) => String(value || '').trim();
     const targetGameId = normalizeGameId(gameId);
     if (!targetGameId) return;
+
+    const gameDir = path.join(packsDir, targetGameId);
+    const items = await fs.readdir(gameDir, { withFileTypes: true }).catch(() => []);
+    const packDirs = items.filter(d => d.isDirectory()).map(d => d.name).filter(name => name.startsWith('pack_'));
 
     const parseTimestampFromName = (name) => {
       const parts = String(name || '').split('_');
@@ -307,23 +308,9 @@ export async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2, k
       return Number.isFinite(timestamp) ? timestamp : 0;
     };
 
-    const gamePacksInfo = [];
-    for (const name of allPacks) {
-      if (!name.startsWith('pack_')) continue;
-      const packPath = path.join(packsDir, name);
-      const meta = await readPackMeta(packPath);
-      const metaGameId = normalizeGameId(meta?.gameId);
-      if (!metaGameId || metaGameId !== targetGameId) continue;
-      const createdAt =
-        Number.isFinite(Number(meta?.createdAt)) && Number(meta.createdAt) > 0
-          ? Number(meta.createdAt)
-          : parseTimestampFromName(name);
-      gamePacksInfo.push({ name, createdAt });
-    }
-
+    const gamePacksInfo = packDirs.map((name) => ({ name, createdAt: parseTimestampFromName(name) }));
     gamePacksInfo.sort((a, b) => b.createdAt - a.createdAt);
-    
-    // Keep the latest `keepLatest` packs, delete the rest (except explicitly kept)
+
     if (gamePacksInfo.length > keepLatest) {
       const toDelete = gamePacksInfo.slice(keepLatest);
       for (const { name } of toDelete) {
@@ -331,7 +318,7 @@ export async function cleanupOldPacksForGame(gameId, packsDir, keepLatest = 2, k
           log('auto-clean skip (script referenced)', { packId: name });
           continue;
         }
-        const packPath = path.join(packsDir, name);
+        const packPath = path.join(gameDir, name);
         try {
           await fs.rm(packPath, { recursive: true, force: true });
           log('auto-cleaned old pack', { packId: name });
@@ -364,7 +351,7 @@ function extractPackIdsFromBoardAssets(boardAssets) {
   if (!boardAssets || typeof boardAssets !== 'object') return packIds;
   const collectFromValue = (value) => {
     if (typeof value !== 'string') return;
-    const match = value.match(/\/skins\/(pack_[^/]+)\//i);
+    const match = value.match(/\/skins\/(?:[^/]+\/)?(pack_[^/]+)\//i);
     if (match && match[1]) {
       packIds.add(match[1]);
     }
@@ -551,20 +538,53 @@ async function pathExists(targetPath) {
   }
 }
 
-async function findLatestPackForBoard(packsDir, boardId, excludePackId) {
+function getPackUrlPrefix(gameId, packId) {
+  if (gameId) {
+    return `/skins/${String(gameId).trim()}/${packId}`;
+  }
+  return `/skins/${packId}`;
+}
+
+function getPackDir(packsDir, gameId, packId) {
+  if (gameId) {
+    return path.join(packsDir, String(gameId).trim(), packId);
+  }
+  return path.join(packsDir, packId);
+}
+
+async function resolvePackDir(packsDir, gameId, packId) {
+  if (!packId) return null;
+  const normalizedGameId = gameId ? String(gameId).trim() : '';
+  if (normalizedGameId) {
+    const candidate = path.join(packsDir, normalizedGameId, packId);
+    if (await pathExists(candidate)) return candidate;
+  }
+  const legacy = path.join(packsDir, packId);
+  if (await pathExists(legacy)) return legacy;
+  return null;
+}
+
+async function findLatestPackForBoard(packsDir, boardId, excludePackId, gameId) {
   try {
-    const entries = await fs.readdir(packsDir, { withFileTypes: true });
     const candidates = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const name = entry.name;
-      if (!name.startsWith('pack_')) continue;
-      if (excludePackId && name === excludePackId) continue;
-      const boardPath = path.join(packsDir, name, boardId);
-      if (!(await pathExists(boardPath))) continue;
-      const stat = await fs.stat(path.join(packsDir, name));
-      candidates.push({ packId: name, mtime: stat.mtimeMs || 0 });
+    const scanRoot = async (rootDir) => {
+      const entries = await fs.readdir(rootDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const name = entry.name;
+        if (!name.startsWith('pack_')) continue;
+        if (excludePackId && name === excludePackId) continue;
+        const boardPath = path.join(rootDir, name, boardId);
+        if (!(await pathExists(boardPath))) continue;
+        const stat = await fs.stat(path.join(rootDir, name)).catch(() => null);
+        candidates.push({ packId: name, mtime: stat?.mtimeMs || 0 });
+      }
+    };
+    const normalizedGameId = gameId ? String(gameId).trim() : '';
+    if (normalizedGameId) {
+      await scanRoot(path.join(packsDir, normalizedGameId));
     }
+    await scanRoot(packsDir);
     if (!candidates.length) return null;
     candidates.sort((a, b) => b.mtime - a.mtime);
     return candidates[0].packId;
@@ -904,8 +924,8 @@ router.post('/', async (req, res) => {
 
   let resumeSourceDir = null;
   if (resumePackIdClean) {
-    const candidate = path.join(packsDir, resumePackIdClean);
-    if (await pathExists(candidate)) {
+    const candidate = await resolvePackDir(packsDir, gameId, resumePackIdClean);
+    if (candidate) {
       resumeSourceDir = candidate;
     } else {
       log('resume pack requested but missing', { resumePackId: resumePackIdClean });
@@ -947,7 +967,8 @@ router.post('/', async (req, res) => {
   }
 
   const packId = `pack_${Date.now()}_${nanoid(6)}`;
-  const baseDir = path.join(packsDir, packId);
+  const packUrlPrefix = getPackUrlPrefix(gameId, packId);
+  const baseDir = getPackDir(packsDir, gameId, packId);
   log('POST create pack', {
     packId,
     gameId,
@@ -1015,11 +1036,7 @@ router.post('/', async (req, res) => {
     attachAbortController(progressChannelResolved, upstreamAbortController);
 
     await fs.mkdir(baseDir, { recursive: true });
-	    await writePackMeta(baseDir, {
-	      packId,
-	      gameId: gameId || null,
-	      createdAt: Date.now(),
-	    });
+      // No pack-meta writes; script is the source of truth.
 
     let boardAssets = {};  // Use 'let' to allow recreation if frozen
     const rewriteAssetUrl = (value) => {
@@ -1229,15 +1246,17 @@ router.post('/', async (req, res) => {
             continue;
           }
           
-          let sourcePath = path.join(packsDir, sourcePackId, boardId);
+          let sourcePackDir = await resolvePackDir(packsDir, gameId, sourcePackId);
+          let sourcePath = sourcePackDir ? path.join(sourcePackDir, boardId) : null;
           const destPath = path.join(baseDir, boardId);
           
           try {
             // Check if source exists, fallback to resume pack if the extracted one was cleaned.
-            const sourceExists = await pathExists(sourcePath);
+            const sourceExists = sourcePath ? await pathExists(sourcePath) : false;
             if (!sourceExists && resumePackIdClean && resumePackIdClean !== sourcePackId) {
-              const fallbackPath = path.join(packsDir, resumePackIdClean, boardId);
-              const fallbackExists = await pathExists(fallbackPath);
+              const fallbackPackDir = await resolvePackDir(packsDir, gameId, resumePackIdClean);
+              const fallbackPath = fallbackPackDir ? path.join(fallbackPackDir, boardId) : null;
+              const fallbackExists = fallbackPath ? await pathExists(fallbackPath) : false;
               if (fallbackExists) {
                 log('fallback to resume pack for board copy', {
                   packId,
@@ -1246,9 +1265,10 @@ router.post('/', async (req, res) => {
                   fallbackPackId: resumePackIdClean,
                 });
                 sourcePackId = resumePackIdClean;
+                sourcePackDir = fallbackPackDir;
                 sourcePath = fallbackPath;
               } else {
-                const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId);
+                const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId, gameId);
                 if (latestPackId) {
                   log('fallback to latest available pack for board copy', {
                     packId,
@@ -1258,7 +1278,8 @@ router.post('/', async (req, res) => {
                     latestPackId,
                   });
                   sourcePackId = latestPackId;
-                  sourcePath = path.join(packsDir, latestPackId, boardId);
+                  sourcePackDir = await resolvePackDir(packsDir, gameId, latestPackId);
+                  sourcePath = sourcePackDir ? path.join(sourcePackDir, boardId) : null;
                 } else {
                   log('no source board directory found', {
                     packId,
@@ -1270,7 +1291,7 @@ router.post('/', async (req, res) => {
                 }
               }
             } else if (!sourceExists) {
-              const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId);
+              const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId, gameId);
               if (latestPackId) {
                 log('fallback to latest available pack for board copy', {
                   packId,
@@ -1279,7 +1300,8 @@ router.post('/', async (req, res) => {
                   latestPackId,
                 });
                 sourcePackId = latestPackId;
-                sourcePath = path.join(packsDir, latestPackId, boardId);
+                sourcePackDir = await resolvePackDir(packsDir, gameId, latestPackId);
+                sourcePath = sourcePackDir ? path.join(sourcePackDir, boardId) : null;
               } else {
                 log('no source board directory found', { packId, boardId, sourcePackId });
                 continue;
@@ -1451,10 +1473,10 @@ router.post('/', async (req, res) => {
           }
           await fs.mkdir(destBoard, { recursive: true });
           await fs.cp(srcBoard, destBoard, { recursive: true });
-          const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
-          const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
-          const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
-          const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
+          const boardPreviewRel = `${packUrlPrefix}/${boardId}/board/preview.svg`;
+          const bgRel = `${packUrlPrefix}/${boardId}/board/background.svg`;
+          const lightRel = `${packUrlPrefix}/${boardId}/board/tileLight.svg`;
+          const darkRel = `${packUrlPrefix}/${boardId}/board/tileDark.svg`;
           boardAssets[boardId] ||= {};
           boardAssets[boardId].boardPreview ||= boardPreviewRel;
           boardAssets[boardId].background ||= bgRel;
@@ -1577,7 +1599,7 @@ router.post('/', async (req, res) => {
         packId,
         renderStyle,
         renderDetail,
-        baseUrl: `/skins/${packId}`,
+        baseUrl: packUrlPrefix,
         manifestUrl: null,
         progressChannel: progressChannelResolved,
         active: true,
@@ -1686,9 +1708,12 @@ router.post('/', async (req, res) => {
           });
 
           if (existingBoardPath && !(await pathExists(existingBoardPath))) {
-            const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId);
+            const latestPackId = await findLatestPackForBoard(packsDir, boardId, packId, gameId);
             if (latestPackId) {
-              existingBoardPath = path.join(packsDir, latestPackId, boardId, 'board');
+              const latestPackDir = await resolvePackDir(packsDir, gameId, latestPackId);
+              existingBoardPath = latestPackDir
+                ? path.join(latestPackDir, boardId, 'board')
+                : null;
               log('writeBoardAsset fallback existingBoardPath', {
                 packId,
                 boardId,
@@ -1779,10 +1804,10 @@ router.post('/', async (req, res) => {
                   fs.copyFile(existingPreviewPath, path.join(boardPath, 'preview.svg')),
                 ]);
                 
-                const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
-                const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
-                const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
-                const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+                const bgRel = `${packUrlPrefix}/${boardId}/board/background.svg`;
+                const lightRel = `${packUrlPrefix}/${boardId}/board/tileLight.svg`;
+                const darkRel = `${packUrlPrefix}/${boardId}/board/tileDark.svg`;
+                const boardPreviewRel = `${packUrlPrefix}/${boardId}/board/preview.svg`;
                 
                 boardAssets[boardId] = {
                   ...(boardAssets[boardId] || {}),
@@ -1845,10 +1870,10 @@ router.post('/', async (req, res) => {
               }
             };
 
-            const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
-            const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
-            const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
-            const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+            const bgRel = `${packUrlPrefix}/${boardId}/board/background.svg`;
+            const lightRel = `${packUrlPrefix}/${boardId}/board/tileLight.svg`;
+            const darkRel = `${packUrlPrefix}/${boardId}/board/tileDark.svg`;
+            const boardPreviewRel = `${packUrlPrefix}/${boardId}/board/preview.svg`;
 
             if (!wantsBackground) {
               const copied = await copyIfPresent(
@@ -2168,10 +2193,10 @@ router.post('/', async (req, res) => {
               tileDarkSvg = renderTileSVG({ fill: dark, accent, outline, isLight: false, seed: darkSeed });
             }
             
-            const bgRel = `/skins/${packId}/${boardId}/board/background.svg`;
-            const lightRel = `/skins/${packId}/${boardId}/board/tileLight.svg`;
-            const darkRel = `/skins/${packId}/${boardId}/board/tileDark.svg`;
-            const boardPreviewRel = `/skins/${packId}/${boardId}/board/preview.svg`;
+            const bgRel = `${packUrlPrefix}/${boardId}/board/background.svg`;
+            const lightRel = `${packUrlPrefix}/${boardId}/board/tileLight.svg`;
+            const darkRel = `${packUrlPrefix}/${boardId}/board/tileDark.svg`;
+            const boardPreviewRel = `${packUrlPrefix}/${boardId}/board/preview.svg`;
             if (wantsBackground && backgroundSvg) {
               await fs.writeFile(path.join(boardPath, 'background.svg'), backgroundSvg, 'utf8');
             }
@@ -2414,7 +2439,7 @@ router.post('/', async (req, res) => {
               await fs.writeFile(filePath, existingSvg, 'utf8');
 
               const rolePath = isCover ? 'cover' : `pieces/${p.role}`;
-              const urlPath = `/skins/${packId}/${boardId}/${rolePath}/${filename}`;
+              const urlPath = `${packUrlPrefix}/${boardId}/${rolePath}/${filename}`;
               
               // Phase 2: Use formatIdentifier for consistent reused asset keys
               const assetKey = formatIdentifier({
@@ -2678,7 +2703,7 @@ router.post('/', async (req, res) => {
           log('   wrote asset', { packId, boardId, role: p.role, variant, filePath });
 
           const rolePath = isCover ? 'cover' : `pieces/${p.role}`;
-          const urlPath = `/skins/${packId}/${boardId}/${rolePath}/${filename}`;
+          const urlPath = `${packUrlPrefix}/${boardId}/${rolePath}/${filename}`;
           
           // Phase 2: Use formatIdentifier for consistent key generation
           const assetKey = formatIdentifier({
@@ -2756,7 +2781,7 @@ router.post('/', async (req, res) => {
         cancelled: true,
         error: 'cancelled',
         packId,
-        baseUrl: `/skins/${packId}/`,
+        baseUrl: `${packUrlPrefix}/`,
         manifestUrl: finalManifestUrl,
         boardAssets: sortBoardAssets(boardAssets),
         renderStyle,
@@ -2806,7 +2831,7 @@ router.post('/', async (req, res) => {
       'complete',
       {
         packId,
-        baseUrl: `/skins/${packId}/`,
+        baseUrl: `${packUrlPrefix}/`,
         manifestUrl: finalManifestUrl,
         boardAssets: sortBoardAssets(boardAssets),
         renderStyle,
@@ -2842,7 +2867,7 @@ router.post('/', async (req, res) => {
     res.status(201).json({
       ok: true,
       packId,
-      baseUrl: `/skins/${packId}/`,
+      baseUrl: `${packUrlPrefix}/`,
       manifestUrl: finalManifestUrl,
       boardAssets: sortBoardAssets(boardAssets),
       renderStyle,
@@ -2879,14 +2904,26 @@ router.post('/', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   const packsDir = req.app.get('packsDir');
   const packId = req.params.id;
+  const gameId = req.query?.gameId ? String(req.query.gameId).trim() : null;
   if (!packId) {
     return res.status(400).json({ ok: false, error: 'packId required' });
   }
 
-  const packPath = path.join(packsDir, packId);
+  let packPath = await resolvePackDir(packsDir, gameId, packId);
+  if (!packPath) {
+    const gameDirs = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of gameDirs) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(packsDir, entry.name, packId);
+      if (await pathExists(candidate)) {
+        packPath = candidate;
+        break;
+      }
+    }
+  }
 
   try {
-    const stat = await fs.stat(packPath).catch(() => null);
+    const stat = packPath ? await fs.stat(packPath).catch(() => null) : null;
     if (!stat) {
       return res.json({ ok: true, packId, deleted: false });
     }
@@ -2913,42 +2950,25 @@ router.delete('/for-game/:gameId', async (req, res) => {
   }
 
   try {
-    const items = await fs.readdir(packsDir, { withFileTypes: true }).catch(() => []);
-    const allPacks = items.filter(d => d.isDirectory()).map(d => d.name);
-    
     const normalizeGameId = (value) => String(value || '').trim();
     const targetGameId = normalizeGameId(gameId);
     if (!targetGameId) {
       return res.status(400).json({ ok: false, error: 'gameId required' });
     }
 
-    const deleted = [];
-    const failed = [];
-    
-    for (const packName of allPacks) {
-      const packPath = path.join(packsDir, packName);
-      try {
-        const meta = await readPackMeta(packPath);
-        const metaGameId = normalizeGameId(meta?.gameId);
-        if (!metaGameId || metaGameId !== targetGameId) {
-          continue;
-        }
-        await fs.rm(packPath, { recursive: true, force: true });
-        deleted.push(packName);
-        log('deleted pack for game cleanup', { gameId, packId: packName });
-      } catch (err) {
-        failed.push(packName);
-        log('failed to delete pack for game', { gameId, packId: packName, error: err?.message || err });
-      }
+    const gameDir = path.join(packsDir, targetGameId);
+    const stat = await fs.stat(gameDir).catch(() => null);
+    if (!stat) {
+      return res.json({ ok: true, gameId: targetGameId, deleted: true, removed: [] });
     }
 
+    await fs.rm(gameDir, { recursive: true, force: true });
+    log('deleted game packs folder', { gameId: targetGameId });
     res.json({
       ok: true,
-      gameId,
-      deleted,
-      failed,
-      totalDeleted: deleted.length,
-      totalFailed: failed.length,
+      gameId: targetGameId,
+      deleted: true,
+      removed: [gameDir],
     });
   } catch (err) {
     log('cleanup packs for game failed', { gameId, error: err?.message || err });
