@@ -349,6 +349,29 @@ function collectJobPrompts(state) {
 function extractPackIdsFromBoardAssets(boardAssets) {
   const packIds = new Set();
   if (!boardAssets || typeof boardAssets !== 'object') return packIds;
+  const collectFromTokenValue = (value) => {
+    if (!value) return;
+    if (typeof value === 'string') {
+      collectFromValue(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => collectFromTokenValue(item));
+      return;
+    }
+    if (typeof value === 'object') {
+      if (Array.isArray(value.frames)) {
+        value.frames.forEach((item) => collectFromValue(item));
+      }
+      if (value.sets && typeof value.sets === 'object') {
+        Object.values(value.sets).forEach((set) => {
+          if (Array.isArray(set?.frames)) {
+            set.frames.forEach((item) => collectFromValue(item));
+          }
+        });
+      }
+    }
+  };
   const collectFromValue = (value) => {
     if (typeof value !== 'string') return;
     const match = value.match(/\/skins\/(?:[^/]+\/)?(pack_[^/]+)\//i);
@@ -364,7 +387,7 @@ function extractPackIdsFromBoardAssets(boardAssets) {
     collectFromValue(entry.tileLight);
     collectFromValue(entry.tileDark);
     if (entry.tokens && typeof entry.tokens === 'object') {
-      Object.values(entry.tokens).forEach((url) => collectFromValue(url));
+      Object.values(entry.tokens).forEach((url) => collectFromTokenValue(url));
     }
   });
   return packIds;
@@ -461,7 +484,14 @@ const createSchema = Joi.object({
       background: Joi.string().allow('', null),
       tileLight: Joi.string().allow('', null),
       tileDark: Joi.string().allow('', null),
-      tokens: Joi.object().pattern(Joi.string(), Joi.string().allow('', null)),
+      tokens: Joi.object().pattern(
+        Joi.string(),
+        Joi.alternatives().try(
+          Joi.string().allow('', null),
+          Joi.array().items(Joi.string().allow('', null)),
+          Joi.object().unknown(true),
+        ),
+      ),
     })
   ).default({}), // Existing board assets with URLs to copy from
   size: Joi.number().integer().min(64).max(1024).default(512), // SVG viewBox (square)
@@ -1043,6 +1073,27 @@ router.post('/', async (req, res) => {
       if (typeof value !== 'string') return value;
       return value.replace(/\/skins\/pack_[^/]+/g, `/skins/${packId}`);
     };
+    const rewriteTokenValue = (value) => {
+      if (!value) return value;
+      if (typeof value === 'string') return rewriteAssetUrl(value);
+      if (Array.isArray(value)) return value.map((item) => rewriteTokenValue(item));
+      if (typeof value === 'object') {
+        const next = JSON.parse(JSON.stringify(value));
+        if (Array.isArray(next.frames)) {
+          next.frames = next.frames.map((item) => rewriteAssetUrl(item));
+        }
+        if (next.sets && typeof next.sets === 'object') {
+          Object.entries(next.sets).forEach(([setKey, setValue]) => {
+            if (!setValue || typeof setValue !== 'object') return;
+            if (Array.isArray(setValue.frames)) {
+              next.sets[setKey] = { ...setValue, frames: setValue.frames.map((item) => rewriteAssetUrl(item)) };
+            }
+          });
+        }
+        return next;
+      }
+      return value;
+    };
     const rewriteBoardAssets = (input) => {
       if (!input || typeof input !== 'object') return {};
       const out = {};
@@ -1053,7 +1104,7 @@ router.post('/', async (req, res) => {
           if (key === 'tokens' && value && typeof value === 'object') {
             const tokens = {};
             Object.entries(value).forEach(([tokenKey, tokenUrl]) => {
-              tokens[tokenKey] = rewriteAssetUrl(tokenUrl);
+              tokens[tokenKey] = rewriteTokenValue(tokenUrl);
             });
             next.tokens = tokens;
             return;
@@ -1332,9 +1383,13 @@ router.post('/', async (req, res) => {
             if (existing.tokens && typeof existing.tokens === 'object') {
               updatedBoardData.tokens = {};
               for (const [variant, url] of Object.entries(existing.tokens)) {
+                if (!url) continue;
                 if (typeof url === 'string') {
                   updatedBoardData.tokens[variant] = url.replace(sourcePackId, packId);
+                  continue;
                 }
+                // Animation token object/array: rewrite any nested frame urls
+                updatedBoardData.tokens[variant] = rewriteTokenValue(url);
               }
             }
             // Assign the complete object at once
