@@ -1,6 +1,7 @@
-FROM node:18-alpine
+FROM node:alpine
 
 WORKDIR /usr/src/app
+RUN npm install -g npm@11.7.0
 
 COPY package*.json ./
 # install dev deps so nodemon is available

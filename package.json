@@ -7,17 +7,25 @@
   "scripts": {
     "start": "node src/server.js",
     "start:dev": "nodemon --watch src --ext js,json --exec node src/server.js",
-    "test": "node --test"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "test:debug": "node --inspect-brk ./node_modules/vitest/vitest.mjs --run",
+    "test:e2e": "vitest run --include test/e2e/**/*.spec.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "joi": "^17.13.3",
-    "mime": "^4.0.4",
-    "morgan": "^1.10.0",
-    "nanoid": "^5.0.7",
-    "nodemon": "^3.1.4",
-    "socket.io": "^4.7.5"
+    "express": "^5.2.1",
+    "joi": "^18.0.2",
+    "mime": "^4.1.0",
+    "morgan": "^1.10.1",
+    "nanoid": "^5.1.6",
+    "nodemon": "^3.1.11",
+    "socket.io": "^4.8.3"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "vitest": "^3.2.1",
+    "@vitest/coverage-v8": "^3.2.1",
+    "vite-tsconfig-paths": "^5.1.0"
+  }
 }
